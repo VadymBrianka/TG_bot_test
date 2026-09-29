@@ -654,6 +654,46 @@ async def handle_quick_expense(message: Message):
         }).execute()
         await message.reply(f"🔴 <b>Витрату записано:</b> -{amount:,.2f} грн\nОпис: <i>{desc}</i>", parse_mode="HTML")
 
+# --- ЗАКРИТТЯ ЦІЛІ (ВИТРАТА НА ДОСЯГНУТУ ЦІЛЬ) ---
+
+async def handle_close_goal(request: web.Request):
+    try:
+        goal_id = request.match_info.get("id")
+        goal_res = supabase.table("goals").select("*").eq("id", goal_id).execute().data
+        if not goal_res:
+            return web.json_response({"error": "Ціль не знайдено"}, status=404)
+        
+        goal = goal_res[0]
+        user_uuid = goal["user_id"]
+        current_amount = float(goal.get("current_amount", 0))
+        title = goal.get("title", "Ціль")
+        goal_curr = goal.get("currency", "UAH")
+
+        # Отримуємо основний рахунок користувача для прив'язки операції
+        accs = supabase.table("accounts").select("id").eq("user_id", user_uuid).limit(1).execute().data
+        acc_id = accs[0]["id"] if accs else None
+
+        # Якщо в цілі були накопичені кошти, записуємо їх як витрату на цю ціль
+        if current_amount > 0 and acc_id:
+            supabase.table("transactions").insert({
+                "user_id": user_uuid,
+                "account_id": acc_id,
+                "amount": current_amount,
+                "type": "expense",
+                "note": f"🎯 Досягнення цілі: {title} ({current_amount:,.2f} {goal_curr})"
+            }).execute()
+
+        # Видаляємо закриту ціль
+        supabase.table("goals").delete().eq("id", goal_id).execute()
+
+        return web.json_response({
+            "status": "success",
+            "message": f"Ціль «{title}» успішно досягнуто та закрито!"
+        })
+    except Exception as e:
+        logging.error(f"Close goal error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
 async def main():
     asyncio.create_task(update_rates_from_nbu())
 
@@ -675,6 +715,7 @@ async def main():
     app.router.add_put("/api/v1/goals/{id}", handle_update_goal)
     app.router.add_post("/api/v1/goals/funds", handle_modify_goal_funds)
     app.router.add_delete("/api/v1/goals/{id}", handle_delete_goal)
+    app.router.add_post("/api/v1/goals/{id}/close", handle_close_goal)
 
     app.router.add_post("/api/v1/investments", handle_create_investment)
     app.router.add_put("/api/v1/investments/{id}", handle_update_investment)
