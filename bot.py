@@ -76,7 +76,7 @@ async def cors_middleware(request: web.Request, handler):
 # --- HTTP API ЕНДПОІНТИ ---
 
 async def handle_health(request: web.Request):
-    return web.Response(text="FinTrack Bot Engine is live! 🚀", status=200)
+    return web.Response(text="FinTrack Engine is live! 🚀", status=200)
 
 async def handle_dashboard_summary(request: web.Request):
     try:
@@ -90,7 +90,7 @@ async def handle_dashboard_summary(request: web.Request):
             return web.json_response({"error": "User not found"}, status=404)
 
         accs = supabase.table("accounts").select("*").eq("user_id", user_uuid).order("created_at").execute().data
-        invs = supabase.table("investments").select("*").eq("user_id", user_uuid).execute().data
+        invs = supabase.table("investments").select("*").eq("user_id", user_uuid).order("updated_at", desc=True).execute().data
         goals = supabase.table("goals").select("*").eq("user_id", user_uuid).order("created_at").execute().data
         txs = supabase.table("transactions").select("*, categories(name, icon)")\
             .eq("user_id", user_uuid).order("transaction_date", desc=True).limit(30).execute().data
@@ -104,7 +104,6 @@ async def handle_dashboard_summary(request: web.Request):
             for i in invs
         )
         total_goals_uah = sum(float(g["current_amount"]) * rates.get(g["currency"], 1.0) for g in goals)
-
         net_worth = total_accounts_uah + total_investments_uah + total_goals_uah
 
         return web.json_response({
@@ -185,6 +184,20 @@ async def handle_create_account(request: web.Request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
+async def handle_update_account(request: web.Request):
+    try:
+        acc_id = request.match_info.get("id")
+        data = await request.json()
+        res = supabase.table("accounts").update({
+            "name": data.get("name"),
+            "account_type": data.get("account_type"),
+            "currency": data.get("currency"),
+            "balance": float(data.get("balance", 0.0))
+        }).eq("id", acc_id).execute()
+        return web.json_response({"status": "updated", "account": res.data[0]})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
 async def handle_delete_account(request: web.Request):
     try:
         acc_id = request.match_info.get("id")
@@ -193,7 +206,7 @@ async def handle_delete_account(request: web.Request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-# --- КЕРУВАННЯ СКАРБНИЧКАМИ / НАКОПИЧЕННЯМИ (CRUD + Поповнення/Зняття) ---
+# --- КЕРУВАННЯ СКАРБНИЧКАМИ (CRUD + Операції) ---
 
 async def handle_create_goal(request: web.Request):
     try:
@@ -215,14 +228,27 @@ async def handle_create_goal(request: web.Request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
+async def handle_update_goal(request: web.Request):
+    try:
+        goal_id = request.match_info.get("id")
+        data = await request.json()
+        res = supabase.table("goals").update({
+            "title": data.get("title"),
+            "target_amount": float(data.get("target_amount", 0)),
+            "currency": data.get("currency", "UAH"),
+            "deadline": data.get("deadline") or None
+        }).eq("id", goal_id).execute()
+        return web.json_response({"status": "updated", "goal": res.data[0]})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
 async def handle_modify_goal_funds(request: web.Request):
-    """Поповнення скарбнички з рахунку або зняття коштів зі скарбнички на рахунок"""
     try:
         data = await request.json()
         goal_id = data.get("goal_id")
         account_id = data.get("account_id")
         amount = float(data.get("amount", 0))
-        action = data.get("action") # 'deposit' або 'withdraw'
+        action = data.get("action")
 
         if not goal_id or not account_id or amount <= 0:
             return web.json_response({"error": "Некоректні параметри"}, status=400)
@@ -235,16 +261,14 @@ async def handle_modify_goal_funds(request: web.Request):
 
         if action == "deposit":
             if acc_balance < amount:
-                return web.json_response({"error": "Недостатньо коштів на рахунку списання"}, status=400)
+                return web.json_response({"error": "Недостатньо коштів на рахунку"}, status=400)
             supabase.table("accounts").update({"balance": acc_balance - amount}).eq("id", account_id).execute()
             supabase.table("goals").update({"current_amount": goal_balance + amount}).eq("id", goal_id).execute()
         elif action == "withdraw":
             if goal_balance < amount:
-                return web.json_response({"error": "У скарбничці недостатньо коштів для зняття"}, status=400)
+                return web.json_response({"error": "У цілі недостатньо коштів"}, status=400)
             supabase.table("goals").update({"current_amount": goal_balance - amount}).eq("id", goal_id).execute()
             supabase.table("accounts").update({"balance": acc_balance + amount}).eq("id", account_id).execute()
-        else:
-            return web.json_response({"error": "Невідома дія"}, status=400)
 
         return web.json_response({"status": "success"})
     except Exception as e:
@@ -254,6 +278,58 @@ async def handle_delete_goal(request: web.Request):
     try:
         goal_id = request.match_info.get("id")
         supabase.table("goals").delete().eq("id", goal_id).execute()
+        return web.json_response({"status": "deleted"})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+# --- КЕРУВАННЯ ІНВЕСТИЦІЯМИ (CRUD) ---
+
+async def handle_create_investment(request: web.Request):
+    try:
+        data = await request.json()
+        tg_id = int(data.get("telegram_id"))
+        user_uuid = get_user_uuid_by_tg_id(tg_id)
+        if not user_uuid:
+            return web.json_response({"error": "User not found"}, status=404)
+
+        qty = float(data.get("quantity", 0))
+        buy_price = float(data.get("buy_price_avg", 0))
+        cur_price = float(data.get("current_price", buy_price))
+
+        res = supabase.table("investments").insert({
+            "user_id": user_uuid,
+            "ticker": data.get("ticker").upper(),
+            "asset_class": data.get("asset_class", "stock"),
+            "quantity": qty,
+            "buy_price_avg": buy_price,
+            "current_price": cur_price,
+            "currency": data.get("currency", "USD")
+        }).execute()
+        return web.json_response({"status": "success", "investment": res.data[0]})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_update_investment(request: web.Request):
+    try:
+        inv_id = request.match_info.get("id")
+        data = await request.json()
+        res = supabase.table("investments").update({
+            "ticker": data.get("ticker").upper(),
+            "asset_class": data.get("asset_class"),
+            "quantity": float(data.get("quantity", 0)),
+            "buy_price_avg": float(data.get("buy_price_avg", 0)),
+            "current_price": float(data.get("current_price", 0)),
+            "currency": data.get("currency", "USD"),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", inv_id).execute()
+        return web.json_response({"status": "updated", "investment": res.data[0]})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_delete_investment(request: web.Request):
+    try:
+        inv_id = request.match_info.get("id")
+        supabase.table("investments").delete().eq("id", inv_id).execute()
         return web.json_response({"status": "deleted"})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
@@ -305,7 +381,7 @@ async def handle_analytics_and_forecast(request: web.Request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-# --- ОБРОБНИКИ КОМАНД TELEGRAM ---
+# --- ОБРОБНИКИ ТЕЛЕГРАМ-БОТА ---
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -340,11 +416,11 @@ async def cmd_start(message: Message):
 
     await message.answer(
         f"Вітаю, {user.first_name}! 💼\n\n"
-        "<b>FinTrack Bot</b> готовий до роботи:\n\n"
+        "<b>FinTrack Pro</b> готовий до роботи:\n\n"
         "⚡ <b>Швидкий запис у чаті:</b>\n"
         "• <code>Кава 75</code> або <code>Сільпо 420</code>\n"
         "• <code>+25000 Зарплата</code>\n\n"
-        "📋 <b>Команди звітності:</b>\n"
+        "📋 <b>Команди:</b>\n"
         "• /balance — залишки на рахунках\n"
         "• /today — доходи та витрати за день\n"
         "• /month — повний звіт за поточний місяць\n\n"
@@ -386,18 +462,15 @@ async def cmd_today(message: Message):
         parse_mode="HTML"
     )
 
-# ВИПРАВЛЕНО: команда /month тепер рахує з першого числа поточного місяця
 @dp.message(Command("month"))
 async def cmd_month(message: Message):
     user_uuid = get_user_uuid_by_tg_id(message.from_user.id)
     if not user_uuid:
-        await message.answer("Спочатку запустіть бота командою /start")
+        await message.answer("Спочатку запустіть бота через /start")
         return
 
-    # Перше число поточного місяця 00:00:00
     now = datetime.now(timezone.utc)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-
     txs = supabase.table("transactions").select("*").eq("user_id", user_uuid).gte("transaction_date", month_start).execute().data
 
     income = sum(float(t["amount"]) for t in txs if t["type"] == "income")
@@ -411,7 +484,7 @@ async def cmd_month(message: Message):
         f"🔴 Витрати: <b>-{expense:,.2f} грн</b>\n"
         f"────────────────────\n"
         f"💵 Чисте сальдо: <b>{'+' if net >= 0 else ''}{net:,.2f} грн</b>\n"
-        f"📝 Всього операцій: <b>{len(txs)}</b>",
+        f"📝 Операцій: <b>{len(txs)}</b>",
         parse_mode="HTML"
     )
 
@@ -462,12 +535,19 @@ async def main():
     
     # Рахунки
     app.router.add_post("/api/v1/accounts", handle_create_account)
+    app.router.add_put("/api/v1/accounts/{id}", handle_update_account)
     app.router.add_delete("/api/v1/accounts/{id}", handle_delete_account)
     
     # Скарбнички
     app.router.add_post("/api/v1/goals", handle_create_goal)
+    app.router.add_put("/api/v1/goals/{id}", handle_update_goal)
     app.router.add_post("/api/v1/goals/funds", handle_modify_goal_funds)
     app.router.add_delete("/api/v1/goals/{id}", handle_delete_goal)
+
+    # Інвестиції
+    app.router.add_post("/api/v1/investments", handle_create_investment)
+    app.router.add_put("/api/v1/investments/{id}", handle_update_investment)
+    app.router.add_delete("/api/v1/investments/{id}", handle_delete_investment)
 
     # Аналітика та прогноз
     app.router.add_get("/api/v1/analytics/forecast", handle_analytics_and_forecast)
