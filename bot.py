@@ -35,13 +35,30 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- ДОПОМІЖНІ ФУНКЦІЇ ---
-
 def get_user_uuid_by_tg_id(tg_id: int) -> str | None:
     res = supabase.table("users").select("id").eq("telegram_id", tg_id).execute()
     if res.data:
         return res.data[0]["id"]
     return None
+
+# --- ОНОВЛЕННЯ КУРСІВ ВАЛЮТ З НБУ ---
+
+async def update_rates_from_nbu():
+    try:
+        url = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    records = [{"currency": "UAH", "rate_to_base": 1.0}]
+                    for item in data:
+                        cc = item.get("cc")
+                        rate = float(item.get("rate", 1.0))
+                        records.append({"currency": cc, "rate_to_base": rate})
+                    supabase.table("exchange_rates").upsert(records).execute()
+                    logging.info("Exchange rates updated successfully from NBU")
+    except Exception as e:
+        logging.error(f"Failed to update rates from NBU: {e}")
 
 # --- CORS MIDDLEWARE ---
 
@@ -60,6 +77,13 @@ async def cors_middleware(request: web.Request, handler):
 
 async def handle_health(request: web.Request):
     return web.Response(text="FinTrack Engine is live! 🚀", status=200)
+
+async def handle_get_currencies(request: web.Request):
+    try:
+        res = supabase.table("exchange_rates").select("currency, rate_to_base").order("currency").execute().data
+        return web.json_response({"currencies": res})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 async def handle_dashboard_summary(request: web.Request):
     try:
@@ -123,10 +147,9 @@ async def handle_create_transaction(request: web.Request):
         if not account_id:
             return web.json_response({"error": "Основний рахунок не обрано"}, status=400)
 
-        # Отримуємо рахунок списання
         acc_from_res = supabase.table("accounts").select("balance").eq("id", account_id).execute().data
         if not acc_from_res:
-            return web.json_response({"error": "Рахунок відправника не знайдено"}, status=404)
+            return web.json_response({"error": "Рахунок не знайдено"}, status=404)
         acc_from_bal = float(acc_from_res[0]["balance"])
 
         if tx_type == "expense":
@@ -142,7 +165,6 @@ async def handle_create_transaction(request: web.Request):
                 return web.json_response({"error": "Рахунок отримувача не знайдено"}, status=404)
             acc_to_bal = float(acc_to_res[0]["balance"])
 
-            # Списуємо з account_id і зараховуємо на to_account_id
             supabase.table("accounts").update({"balance": acc_from_bal - amount}).eq("id", account_id).execute()
             supabase.table("accounts").update({"balance": acc_to_bal + target_amount}).eq("id", to_account_id).execute()
 
@@ -158,22 +180,65 @@ async def handle_create_transaction(request: web.Request):
 
         return web.json_response({"status": "success"})
     except Exception as e:
-        logging.error(f"Transaction error: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
-# --- РИНКОВІ ЦІНИ (АКЦІЇ ТА КРИПТА) ---
+# --- ЖИВИЙ ПОШУК ТА КОТИРУВАННЯ АКТИВІВ ---
+
+async def handle_market_search(request: web.Request):
+    query = request.query.get("q", "").strip().lower()
+    asset_class = request.query.get("type", "stock").strip().lower()
+    if not query or len(query) < 1:
+        return web.json_response({"results": []})
+
+    results = []
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4)) as session:
+            if asset_class == "crypto":
+                url = f"https://api.binance.com/api/v3/ticker/price"
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        all_tickers = await resp.json()
+                        matched = [
+                            {
+                                "ticker": t["symbol"].replace("USDT", ""),
+                                "name": f"{t['symbol'].replace('USDT', '')} (Crypto)",
+                                "price": round(float(t["price"]), 4),
+                                "currency": "USD"
+                            }
+                            for t in all_tickers
+                            if t["symbol"].endswith("USDT") and query in t["symbol"].replace("USDT", "").lower()
+                        ][:8]
+                        return web.json_response({"results": matched})
+
+            elif asset_class == "stock":
+                url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=8&newsCount=0"
+                headers = {"User-Agent": "Mozilla/5.0"}
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for q in data.get("quotes", []):
+                            if q.get("quoteType") in ["EQUITY", "ETF"]:
+                                results.append({
+                                    "ticker": q.get("symbol"),
+                                    "name": q.get("shortname") or q.get("longname") or q.get("symbol"),
+                                    "currency": "USD",
+                                    "price": 0.0
+                                })
+                        return web.json_response({"results": results})
+    except Exception as e:
+        logging.warning(f"Search API warning: {e}")
+
+    return web.json_response({"results": results})
 
 async def handle_market_quote(request: web.Request):
     symbol = request.query.get("symbol", "").strip().upper()
     asset_class = request.query.get("type", "stock").strip().lower()
-    
     if not symbol:
         return web.json_response({"error": "Symbol is required"}, status=400)
 
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
             if asset_class == "crypto":
-                # Перевірка через публічне API Binance (USDT пара)
                 pair = f"{symbol}USDT"
                 url = f"https://api.binance.com/api/v3/ticker/price?symbol={pair}"
                 async with session.get(url) as resp:
@@ -181,12 +246,11 @@ async def handle_market_quote(request: web.Request):
                         data = await resp.json()
                         return web.json_response({
                             "symbol": symbol,
-                            "name": f"{symbol}/USDT",
+                            "name": f"{symbol}",
                             "price": round(float(data["price"]), 4),
                             "currency": "USD"
                         })
             
-            # Для акцій: безкоштовний шлюз Yahoo Finance v8
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
             headers = {"User-Agent": "Mozilla/5.0"}
             async with session.get(url, headers=headers) as resp:
@@ -194,22 +258,18 @@ async def handle_market_quote(request: web.Request):
                     data = await resp.json()
                     meta = data["chart"]["result"][0]["meta"]
                     price = meta.get("regularMarketPrice", 0)
-                    long_name = meta.get("symbol", symbol)
                     curr = meta.get("currency", "USD")
                     return web.json_response({
                         "symbol": symbol,
-                        "name": long_name,
+                        "name": meta.get("symbol", symbol),
                         "price": round(float(price), 4),
                         "currency": curr
                     })
-                    
-        return web.json_response({"error": "Ціну не знайдено, введіть вручну"}, status=404)
+        return web.json_response({"error": "Ціну не знайдено"}, status=404)
     except Exception as e:
-        logging.error(f"Market fetch error: {e}")
-        return web.json_response({"error": "Сервіс котирувань тимчасово недоступний"}, status=502)
+        return web.json_response({"error": "Помилка біржового сервера"}, status=502)
 
-# --- КЕРУВАННЯ РАХУНКАМИ (CRUD) ---
-
+# --- РАХУНКИ ---
 async def handle_create_account(request: web.Request):
     try:
         data = await request.json()
@@ -222,7 +282,7 @@ async def handle_create_account(request: web.Request):
             "user_id": user_uuid,
             "name": data.get("name"),
             "account_type": data.get("account_type", "card"),
-            "currency": data.get("currency", "UAH"),
+            "currency": data.get("currency", "UAH").upper(),
             "balance": float(data.get("balance", 0.0))
         }).execute()
         return web.json_response({"status": "success", "account": res.data[0]})
@@ -236,7 +296,7 @@ async def handle_update_account(request: web.Request):
         res = supabase.table("accounts").update({
             "name": data.get("name"),
             "account_type": data.get("account_type"),
-            "currency": data.get("currency"),
+            "currency": data.get("currency", "UAH").upper(),
             "balance": float(data.get("balance", 0.0))
         }).eq("id", acc_id).execute()
         return web.json_response({"status": "updated", "account": res.data[0]})
@@ -251,8 +311,7 @@ async def handle_delete_account(request: web.Request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-# --- КЕРУВАННЯ СКАРБНИЧКАМИ ---
-
+# --- СКАРБНИЧКИ ---
 async def handle_create_goal(request: web.Request):
     try:
         data = await request.json()
@@ -266,7 +325,7 @@ async def handle_create_goal(request: web.Request):
             "title": data.get("title"),
             "target_amount": float(data.get("target_amount", 0)),
             "current_amount": float(data.get("current_amount", 0)),
-            "currency": data.get("currency", "UAH"),
+            "currency": data.get("currency", "UAH").upper(),
             "deadline": data.get("deadline") or None
         }).execute()
         return web.json_response({"status": "success", "goal": res.data[0]})
@@ -280,7 +339,7 @@ async def handle_update_goal(request: web.Request):
         res = supabase.table("goals").update({
             "title": data.get("title"),
             "target_amount": float(data.get("target_amount", 0)),
-            "currency": data.get("currency", "UAH"),
+            "currency": data.get("currency", "UAH").upper(),
             "deadline": data.get("deadline") or None
         }).eq("id", goal_id).execute()
         return web.json_response({"status": "updated", "goal": res.data[0]})
@@ -327,8 +386,7 @@ async def handle_delete_goal(request: web.Request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-# --- КЕРУВАННЯ ІНВЕСТИЦІЯМИ (З ДОДАТКОВИМИ ПОЛЯМИ) ---
-
+# --- ІНВЕСТИЦІЇ ---
 async def handle_create_investment(request: web.Request):
     try:
         data = await request.json()
@@ -350,7 +408,7 @@ async def handle_create_investment(request: web.Request):
             "quantity": qty,
             "buy_price_avg": buy_price,
             "current_price": cur_price,
-            "currency": data.get("currency", "USD"),
+            "currency": data.get("currency", "USD").upper(),
             "interest_rate": float(data.get("interest_rate", 0.0) or 0.0),
             "maturity_date": data.get("maturity_date") or None,
             "term_months": int(data.get("term_months", 0)) if data.get("term_months") else None
@@ -359,7 +417,6 @@ async def handle_create_investment(request: web.Request):
         res = supabase.table("investments").insert(payload).execute()
         return web.json_response({"status": "success", "investment": res.data[0]})
     except Exception as e:
-        logging.error(f"Create investment error: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
 async def handle_update_investment(request: web.Request):
@@ -373,7 +430,7 @@ async def handle_update_investment(request: web.Request):
             "quantity": float(data.get("quantity", 0)),
             "buy_price_avg": float(data.get("buy_price_avg", 0)),
             "current_price": float(data.get("current_price", 0)),
-            "currency": data.get("currency", "USD"),
+            "currency": data.get("currency", "USD").upper(),
             "interest_rate": float(data.get("interest_rate", 0.0) or 0.0),
             "maturity_date": data.get("maturity_date") or None,
             "term_months": int(data.get("term_months", 0)) if data.get("term_months") else None,
@@ -393,7 +450,6 @@ async def handle_delete_investment(request: web.Request):
         return web.json_response({"error": str(e)}, status=500)
 
 # --- АНАЛІТИКА ---
-
 async def handle_analytics_and_forecast(request: web.Request):
     try:
         tg_id = int(request.query.get("telegram_id"))
@@ -439,8 +495,7 @@ async def handle_analytics_and_forecast(request: web.Request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
-# --- TELEGRAM HANDLERS ---
-
+# --- TELEGRAM COMMANDS ---
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     user = message.from_user
@@ -583,15 +638,18 @@ async def handle_quick_expense(message: Message):
         await message.reply(f"🔴 <b>Витрату записано:</b> -{amount:,.2f} грн\nОпис: <i>{desc}</i>", parse_mode="HTML")
 
 # --- СТАРТ СЕРВЕРА ---
-
 async def main():
+    asyncio.create_task(update_rates_from_nbu())
+
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/", handle_health)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/api/v1/currencies", handle_get_currencies)
     app.router.add_get("/api/v1/dashboard/summary", handle_dashboard_summary)
     app.router.add_post("/api/v1/transactions", handle_create_transaction)
     
-    # Ринок цін
+    # Ринок: пошук і котирування
+    app.router.add_get("/api/v1/market/search", handle_market_search)
     app.router.add_get("/api/v1/market/quote", handle_market_quote)
 
     # Рахунки
