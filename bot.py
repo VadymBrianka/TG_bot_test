@@ -223,24 +223,30 @@ async def handle_analytics_and_forecast(request: web.Request):
 
         start_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
         
-        # Читаємо транзакції з категоріями
-        txs = supabase.table("transactions")\
-            .select("amount, target_amount, type, note, transaction_date, category_id, account_id, to_account_id, categories(name, icon)")\
-            .eq("user_id", user_uuid).gte("transaction_date", start_date).execute().data or []
+        # 1. Завантажуємо чисті транзакції без join (щоб уникнути помилки 500 через NULL category_id)
+        txs_res = supabase.table("transactions")\
+            .select("amount, target_amount, type, note, transaction_date, category_id, account_id, to_account_id")\
+            .eq("user_id", user_uuid).gte("transaction_date", start_date).execute()
+        txs = txs_res.data or []
 
+        # 2. Завантажуємо категорії окремо для створення довідника
+        cats_res = supabase.table("categories").select("id, name, icon").execute()
+        cat_map = {c["id"]: {"name": c["name"], "icon": c["icon"]} for c in (cats_res.data or [])}
+
+        # 3. Завантажуємо рахунки та курси валют
         all_accounts = supabase.table("accounts").select("id, name, balance, currency").eq("user_id", user_uuid).execute().data or []
-        rates_res = supabase.table("exchange_rates").select("*").execute().data or []
+        rates_res = supabase.table("exchange_rates").select("currency, rate_to_base").execute().data or []
         rates = {r["currency"]: float(r["rate_to_base"]) for r in rates_res}
         rates["UAH"] = 1.0
 
-        total_income = sum(float(t["amount"]) for t in txs if t["type"] == "income")
-        total_expense = sum(float(t["amount"]) for t in txs if t["type"] == "expense")
+        total_income = sum(float(t["amount"]) for t in txs if t.get("type") == "income")
+        total_expense = sum(float(t["amount"]) for t in txs if t.get("type") == "expense")
 
         daily_expense = total_expense / max(days_back, 1)
         daily_income = total_income / max(days_back, 1)
         daily_net = daily_income - daily_expense
 
-        current_liquidity = sum(float(a["balance"]) * rates.get(a.get("currency", "UAH"), 1.0) for a in all_accounts)
+        current_liquidity = sum(float(a.get("balance", 0)) * rates.get(a.get("currency", "UAH"), 1.0) for a in all_accounts)
 
         forecast = {
             "week": {
@@ -263,23 +269,27 @@ async def handle_analytics_and_forecast(request: web.Request):
             }
         }
 
-        # Категорії
+        # 4. Агрегація витрат по категоріях
         cat_stats = {}
         for t in txs:
-            if t["type"] == "expense":
-                cname = t["categories"]["name"] if t.get("categories") else "Інше"
-                cicon = t["categories"]["icon"] if t.get("categories") else "⚪"
-                cat_stats[cname] = cat_stats.get(cname, {"name": cname, "icon": cicon, "total": 0})
-                cat_stats[cname]["total"] += float(t["amount"])
-        
+            if t.get("type") == "expense":
+                cid = t.get("category_id")
+                cat_info = cat_map.get(cid)
+                cname = cat_info["name"] if cat_info else "Інше"
+                cicon = cat_info["icon"] if cat_info else "⚪"
+                
+                if cname not in cat_stats:
+                    cat_stats[cname] = {"name": cname, "icon": cicon, "total": 0.0}
+                cat_stats[cname]["total"] += float(t.get("amount", 0))
+
         categories_breakdown = sorted(cat_stats.values(), key=lambda x: x["total"], reverse=True)
 
-        # Оборот по всіх рахунках
+        # 5. Оборот по всіх рахунках із переказами
         acc_dict = {
             a["id"]: {
                 "id": a["id"],
                 "name": a["name"],
-                "currency": a["currency"],
+                "currency": a.get("currency", "UAH"),
                 "income": 0.0,
                 "expense": 0.0,
                 "transfers_in": 0.0,
@@ -291,13 +301,13 @@ async def handle_analytics_and_forecast(request: web.Request):
             from_id = t.get("account_id")
             to_id = t.get("to_account_id")
             amt = float(t.get("amount", 0))
-            t_amt = float(t.get("target_amount", amt))
+            t_amt = float(t.get("target_amount") or amt)
 
-            if t["type"] == "income" and from_id in acc_dict:
+            if t.get("type") == "income" and from_id in acc_dict:
                 acc_dict[from_id]["income"] += amt
-            elif t["type"] == "expense" and from_id in acc_dict:
+            elif t.get("type") == "expense" and from_id in acc_dict:
                 acc_dict[from_id]["expense"] += amt
-            elif t["type"] == "transfer":
+            elif t.get("type") == "transfer":
                 if from_id in acc_dict:
                     acc_dict[from_id]["transfers_out"] += amt
                 if to_id in acc_dict:
@@ -307,8 +317,8 @@ async def handle_analytics_and_forecast(request: web.Request):
 
         return web.json_response({
             "history_days": days_back,
-            "historical_income": total_income,
-            "historical_expense": total_expense,
+            "historical_income": round(total_income, 2),
+            "historical_expense": round(total_expense, 2),
             "daily_burn_rate": round(daily_expense, 2),
             "runway_days": runway_days,
             "current_liquidity": round(current_liquidity, 2),
@@ -417,15 +427,78 @@ async def handle_market_quote(request: web.Request):
     if not symbol:
         return web.json_response({"error": "Symbol is required"}, status=400)
 
-    price = await get_realtime_price(symbol, asset_class)
-    if price is not None:
-        return web.json_response({
-            "symbol": symbol,
-            "name": symbol,
-            "price": price,
-            "currency": "USD"
-        })
-    return web.json_response({"error": "Котирування не знайдено"}, status=404)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4)) as session:
+            if asset_class == "crypto":
+                # 1. Binance USDT пара
+                pair = f"{symbol}USDT"
+                url_b = f"https://api.binance.com/api/v3/ticker/price?symbol={pair}"
+                try:
+                    async with session.get(url_b) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return web.json_response({
+                                "symbol": symbol,
+                                "name": symbol,
+                                "price": round(float(data["price"]), 4),
+                                "currency": "USD"
+                            })
+                except Exception:
+                    pass
+
+                # 2. CoinGecko API Simple Price
+                url_cg = f"https://api.coingecko.com/api/v3/simple/price?ids={symbol.lower()}&vs_currencies=usd"
+                try:
+                    async with session.get(url_cg) as resp:
+                        if resp.status == 200:
+                            cg_data = await resp.json()
+                            if symbol.lower() in cg_data:
+                                return web.json_response({
+                                    "symbol": symbol,
+                                    "name": symbol,
+                                    "price": round(float(cg_data[symbol.lower()]["usd"]), 4),
+                                    "currency": "USD"
+                                })
+                except Exception:
+                    pass
+
+                # 3. CoinCap
+                url_cc = f"https://api.coincap.io/v2/assets?search={symbol}&limit=1"
+                try:
+                    async with session.get(url_cc) as resp:
+                        if resp.status == 200:
+                            cc_data = await resp.json()
+                            if cc_data.get("data"):
+                                return web.json_response({
+                                    "symbol": symbol,
+                                    "name": symbol,
+                                    "price": round(float(cc_data["data"][0]["priceUsd"]), 4),
+                                    "currency": "USD"
+                                })
+                except Exception:
+                    pass
+
+            else:
+                # Yahoo Finance для акцій
+                url_y = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
+                headers = {"User-Agent": "Mozilla/5.0"}
+                async with session.get(url_y, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        meta = data["chart"]["result"][0]["meta"]
+                        price = meta.get("regularMarketPrice", 0)
+                        curr = meta.get("currency", "USD")
+                        return web.json_response({
+                            "symbol": symbol,
+                            "name": meta.get("symbol", symbol),
+                            "price": round(float(price), 4),
+                            "currency": curr
+                        })
+
+        return web.json_response({"error": "Ціну не знайдено, введіть вручну"}, status=404)
+    except Exception as e:
+        logging.error(f"Market quote error: {e}")
+        return web.json_response({"error": "Помилка біржового API"}, status=502)
 
 async def handle_refresh_investment_prices(request: web.Request):
     try:
@@ -458,7 +531,7 @@ async def handle_modify_goal_funds(request: web.Request):
         data = await request.json()
         goal_id = data.get("goal_id")
         account_id = data.get("account_id")
-        amount = float(data.get("amount", 0))
+        amount = float(data.get("amount", 0))  # Сума в валюті цілі
         action = data.get("action")
 
         if not goal_id or not account_id or amount <= 0:
@@ -470,8 +543,10 @@ async def handle_modify_goal_funds(request: web.Request):
         goal_balance = float(goal["current_amount"])
         acc_balance = float(acc["balance"])
 
-        goal_curr = goal.get("currency", "UAH").upper()
-        acc_curr = acc.get("currency", "UAH").upper()
+        goal_curr = str(goal.get("currency", "UAH")).upper()
+        acc_curr = str(acc.get("currency", "UAH")).upper()
+        goal_title = goal.get("title", "Ціль")
+        user_uuid = goal["user_id"]
 
         rates_res = supabase.table("exchange_rates").select("*").execute().data or []
         rates = {r["currency"]: float(r["rate_to_base"]) for r in rates_res}
@@ -480,6 +555,7 @@ async def handle_modify_goal_funds(request: web.Request):
         rate_goal = rates.get(goal_curr, 1.0)
         rate_acc = rates.get(acc_curr, 1.0)
 
+        # Конвертація у валюту рахунку
         amount_in_acc_currency = amount * (rate_goal / rate_acc)
 
         if action == "deposit":
@@ -487,13 +563,38 @@ async def handle_modify_goal_funds(request: web.Request):
                 return web.json_response({
                     "error": f"Недостатньо коштів на рахунку ({amount_in_acc_currency:.2f} {acc_curr})"
                 }, status=400)
+
+            # Списуємо з рахунку, додаємо в ціль
             supabase.table("accounts").update({"balance": acc_balance - amount_in_acc_currency}).eq("id", account_id).execute()
             supabase.table("goals").update({"current_amount": goal_balance + amount}).eq("id", goal_id).execute()
+
+            # Фіксуємо операцію в історії транзакцій
+            supabase.table("transactions").insert({
+                "user_id": user_uuid,
+                "account_id": account_id,
+                "amount": round(amount_in_acc_currency, 2),
+                "target_amount": round(amount, 2),
+                "type": "transfer",
+                "note": f"🎯 Поповнення цілі: {goal_title} ({amount:,.2f} {goal_curr})"
+            }).execute()
+
         elif action == "withdraw":
             if goal_balance < amount:
                 return web.json_response({"error": "У цілі недостатньо коштів"}, status=400)
+
+            # Списуємо з цілі, зараховуємо на рахунок
             supabase.table("goals").update({"current_amount": goal_balance - amount}).eq("id", goal_id).execute()
             supabase.table("accounts").update({"balance": acc_balance + amount_in_acc_currency}).eq("id", account_id).execute()
+
+            # Фіксуємо операцію в історії транзакцій
+            supabase.table("transactions").insert({
+                "user_id": user_uuid,
+                "account_id": account_id,
+                "amount": round(amount_in_acc_currency, 2),
+                "target_amount": round(amount, 2),
+                "type": "transfer",
+                "note": f"🎯 Зняття з цілі: {goal_title} ({amount:,.2f} {goal_curr})"
+            }).execute()
 
         return web.json_response({
             "status": "success",
@@ -501,6 +602,7 @@ async def handle_modify_goal_funds(request: web.Request):
             "account_currency": acc_curr
         })
     except Exception as e:
+        logging.error(f"Goal modify error: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
 async def handle_close_goal(request: web.Request):
