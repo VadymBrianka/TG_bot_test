@@ -343,7 +343,7 @@ async def handle_analytics_and_forecast(request: web.Request):
 
         start_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
         txs = supabase.table("transactions")\
-            .select("amount, type, note, transaction_date, category_id, account_id, categories(name, icon), accounts!account_id(name, currency)")\
+            .select("amount, target_amount, type, note, transaction_date, category_id, account_id, to_account_id, categories(name, icon)")\
             .eq("user_id", user_uuid).gte("transaction_date", start_date).execute().data
 
         total_income = sum(float(t["amount"]) for t in txs if t["type"] == "income")
@@ -353,13 +353,13 @@ async def handle_analytics_and_forecast(request: web.Request):
         daily_income = total_income / max(days_back, 1)
         daily_net = daily_income - daily_expense
 
-        # Прогноз на 7, 30 та 365 днів
-        accs = supabase.table("accounts").select("balance, currency").eq("user_id", user_uuid).execute().data
+        # Всі рахунки користувача
+        all_accounts = supabase.table("accounts").select("id, name, balance, currency").eq("user_id", user_uuid).execute().data
         rates_res = supabase.table("exchange_rates").select("*").execute().data
         rates = {r["currency"]: float(r["rate_to_base"]) for r in rates_res}
         rates["UAH"] = 1.0
 
-        current_liquidity = sum(float(a["balance"]) * rates.get(a.get("currency", "UAH"), 1.0) for a in accs)
+        current_liquidity = sum(float(a["balance"]) * rates.get(a.get("currency", "UAH"), 1.0) for a in all_accounts)
 
         forecast = {
             "week": {
@@ -382,7 +382,7 @@ async def handle_analytics_and_forecast(request: web.Request):
             }
         }
 
-        # Аналітика по категоріях
+        # Категорії
         cat_stats = {}
         for t in txs:
             if t["type"] == "expense":
@@ -393,16 +393,34 @@ async def handle_analytics_and_forecast(request: web.Request):
         
         categories_breakdown = sorted(cat_stats.values(), key=lambda x: x["total"], reverse=True)
 
-        # Аналітика по рахунках
-        acc_stats = {}
+        # Оборот по абсолютно всіх рахунках із врахуванням переказів
+        acc_dict = {
+            a["id"]: {
+                "id": a["id"],
+                "name": a["name"],
+                "currency": a["currency"],
+                "income": 0.0,
+                "expense": 0.0,
+                "transfers_in": 0.0,
+                "transfers_out": 0.0
+            } for a in all_accounts
+        }
+
         for t in txs:
-            aname = t["accounts"]["name"] if t.get("accounts") else "Рахунок"
-            if aname not in acc_stats:
-                acc_stats[aname] = {"name": aname, "income": 0, "expense": 0}
-            if t["type"] == "income":
-                acc_stats[aname]["income"] += float(t["amount"])
-            elif t["type"] == "expense":
-                acc_stats[aname]["expense"] += float(t["amount"])
+            from_id = t.get("account_id")
+            to_id = t.get("to_account_id")
+            amt = float(t.get("amount", 0))
+            t_amt = float(t.get("target_amount", amt))
+
+            if t["type"] == "income" and from_id in acc_dict:
+                acc_dict[from_id]["income"] += amt
+            elif t["type"] == "expense" and from_id in acc_dict:
+                acc_dict[from_id]["expense"] += amt
+            elif t["type"] == "transfer":
+                if from_id in acc_dict:
+                    acc_dict[from_id]["transfers_out"] += amt
+                if to_id in acc_dict:
+                    acc_dict[to_id]["transfers_in"] += t_amt
 
         runway_days = round(current_liquidity / daily_expense) if daily_expense > 0 else 999
 
@@ -415,9 +433,10 @@ async def handle_analytics_and_forecast(request: web.Request):
             "current_liquidity": round(current_liquidity, 2),
             "forecast": forecast,
             "categories_breakdown": categories_breakdown,
-            "accounts_breakdown": list(acc_stats.values())
+            "accounts_breakdown": list(acc_dict.values())
         })
     except Exception as e:
+        logging.error(f"Analytics error: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
 # --- ОПЕРАЦІЇ З ЦІЛЯМИ ---
@@ -704,13 +723,23 @@ async def cmd_balance(message: Message):
         return
 
     accs = supabase.table("accounts").select("*").eq("user_id", user_uuid).execute().data
+    rates_res = supabase.table("exchange_rates").select("*").execute().data
+    rates = {r["currency"]: float(r["rate_to_base"]) for r in rates_res}
+    rates["UAH"] = 1.0
+
     text = "💳 <b>Залишки на ваших рахунках:</b>\n\n"
-    total = 0.0
+    total_uah = 0.0
     for a in accs:
         b = float(a["balance"])
-        total += b
-        text += f"• {a['name']}: <b>{b:,.2f} {a['currency']}</b>\n"
-    text += f"\n💰 <b>Сумарно: {total:,.2f} UAH</b>"
+        curr = a.get("currency", "UAH").upper()
+        rate = rates.get(curr, 1.0)
+        total_uah += b * rate
+        
+        # Якщо валюта не UAH, показуємо еквівалент
+        equiv = f" (~{b * rate:,.2f} грн)" if curr != "UAH" else ""
+        text += f"• {a['name']}: <b>{b:,.2f} {curr}</b>{equiv}\n"
+
+    text += f"\n💰 <b>Сумарний капітал рахунків: {total_uah:,.2f} UAH</b>"
     await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("today"))
