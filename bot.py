@@ -427,79 +427,86 @@ async def handle_market_quote(request: web.Request):
     if not symbol:
         return web.json_response({"error": "Symbol is required"}, status=400)
 
+    # Стандартний браузерний заголовок для обходу блокування хмарних IP
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
+
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4)) as session:
+        async with aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as session:
             if asset_class == "crypto":
-                # 1. Binance USDT пара
-                pair = f"{symbol}USDT"
-                url_b = f"https://api.binance.com/api/v3/ticker/price?symbol={pair}"
+                # Спроба 1: Binance
+                pair_binance = f"{symbol}USDT"
                 try:
+                    url_b = f"https://api.binance.com/api/v3/ticker/price?symbol={pair_binance}"
                     async with session.get(url_b) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            return web.json_response({
-                                "symbol": symbol,
-                                "name": symbol,
-                                "price": round(float(data["price"]), 4),
-                                "currency": "USD"
-                            })
-                except Exception:
-                    pass
+                            p = float(data.get("price", 0))
+                            if p > 0:
+                                return web.json_response({"symbol": symbol, "price": round(p, 4), "currency": "USD"})
+                except Exception as e:
+                    logging.warning(f"Binance quote failed for {symbol}: {e}")
 
-                # 2. CoinGecko API Simple Price
-                url_cg = f"https://api.coingecko.com/api/v3/simple/price?ids={symbol.lower()}&vs_currencies=usd"
+                # Спроба 2: KuCoin
                 try:
-                    async with session.get(url_cg) as resp:
+                    url_k = f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={symbol}-USDT"
+                    async with session.get(url_k) as resp:
                         if resp.status == 200:
-                            cg_data = await resp.json()
-                            if symbol.lower() in cg_data:
-                                return web.json_response({
-                                    "symbol": symbol,
-                                    "name": symbol,
-                                    "price": round(float(cg_data[symbol.lower()]["usd"]), 4),
-                                    "currency": "USD"
-                                })
-                except Exception:
-                    pass
+                            data = await resp.json()
+                            if data.get("data") and data["data"].get("price"):
+                                p = float(data["data"]["price"])
+                                if p > 0:
+                                    return web.json_response({"symbol": symbol, "price": round(p, 4), "currency": "USD"})
+                except Exception as e:
+                    logging.warning(f"KuCoin quote failed for {symbol}: {e}")
 
-                # 3. CoinCap
-                url_cc = f"https://api.coincap.io/v2/assets?search={symbol}&limit=1"
+                # Спроба 3: MEXC
                 try:
+                    url_m = f"https://api.mexc.com/api/v3/ticker/price?symbol={symbol}USDT"
+                    async with session.get(url_m) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            p = float(data.get("price", 0))
+                            if p > 0:
+                                return web.json_response({"symbol": symbol, "price": round(p, 4), "currency": "USD"})
+                except Exception as e:
+                    logging.warning(f"MEXC quote failed for {symbol}: {e}")
+
+                # Спроба 4: CoinCap
+                try:
+                    url_cc = f"https://api.coincap.io/v2/assets?search={symbol}&limit=1"
                     async with session.get(url_cc) as resp:
                         if resp.status == 200:
-                            cc_data = await resp.json()
-                            if cc_data.get("data"):
-                                return web.json_response({
-                                    "symbol": symbol,
-                                    "name": symbol,
-                                    "price": round(float(cc_data["data"][0]["priceUsd"]), 4),
-                                    "currency": "USD"
-                                })
-                except Exception:
-                    pass
+                            data = await resp.json()
+                            items = data.get("data", [])
+                            if items:
+                                p = float(items[0].get("priceUsd", 0))
+                                if p > 0:
+                                    return web.json_response({"symbol": symbol, "price": round(p, 4), "currency": "USD"})
+                except Exception as e:
+                    logging.warning(f"CoinCap quote failed for {symbol}: {e}")
 
             else:
                 # Yahoo Finance для акцій
                 url_y = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
-                headers = {"User-Agent": "Mozilla/5.0"}
-                async with session.get(url_y, headers=headers) as resp:
+                async with session.get(url_y) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        meta = data["chart"]["result"][0]["meta"]
-                        price = meta.get("regularMarketPrice", 0)
-                        curr = meta.get("currency", "USD")
-                        return web.json_response({
-                            "symbol": symbol,
-                            "name": meta.get("symbol", symbol),
-                            "price": round(float(price), 4),
-                            "currency": curr
-                        })
+                        result = data.get("chart", {}).get("result", [])
+                        if result:
+                            meta = result[0].get("meta", {})
+                            p = float(meta.get("regularMarketPrice", 0))
+                            curr = meta.get("currency", "USD")
+                            if p > 0:
+                                return web.json_response({"symbol": symbol, "price": round(p, 4), "currency": curr})
 
-        return web.json_response({"error": "Ціну не знайдено, введіть вручну"}, status=404)
+        return web.json_response({"error": "Ціну не знайдено на біржах. Введіть вручну."}, status=404)
     except Exception as e:
-        logging.error(f"Market quote error: {e}")
-        return web.json_response({"error": "Помилка біржового API"}, status=502)
-
+        logging.error(f"Quote error: {e}")
+        return web.json_response({"error": "Помилка зв'язку з біржею"}, status=502)
+    
 async def handle_refresh_investment_prices(request: web.Request):
     try:
         tg_id = int(request.query.get("telegram_id", 0))
