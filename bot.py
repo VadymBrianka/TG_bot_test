@@ -1,12 +1,12 @@
 import os
-import json
-import hmac
-import hashlib
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl
 from dotenv import load_dotenv
+from aiogram.filters import Command
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+import asyncio
 
 import aiohttp
 from aiohttp import web
@@ -14,7 +14,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, WebAppInfo, MenuButtonWebApp
 from aiogram.filters import CommandStart, Command
 from supabase import create_client, Client
-
+ADMIN_ID = 464800908
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MINIAPP_URL = os.getenv("MINIAPP_URL")
@@ -54,6 +54,65 @@ async def update_rates_from_nbu():
                     logging.info(f"Оновлено {len(records)} курсів валют НБУ.")
     except Exception as e:
         logging.error(f"Помилка оновлення курсів НБУ: {e}")
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    # Отримуємо текст повідомлення після команди /broadcast
+    text_to_send = message.text.partition(" ")[2].strip()
+    if not text_to_send:
+        await message.reply(
+            "Вкажіть текст для розсилки!\nПриклад: <code>/broadcast Увага! Оновлено курси валют.</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    # Завантажуємо всіх користувачів із Supabase
+    users_res = supabase.table("users").select("telegram_id").execute()
+    users = users_res.data or []
+
+    status_msg = await message.answer(f"⏳ Розпочато розсилку для {len(users)} користувачів...")
+
+    success_count = 0
+    blocked_count = 0
+
+    for user in users:
+        user_tg_id = user.get("telegram_id")
+        if not user_tg_id:
+            continue
+
+        try:
+            await bot.send_message(
+                chat_id=user_tg_id,
+                text=text_to_send,
+                parse_mode="HTML"
+            )
+            success_count += 1
+            # Затримка 0.05 сек (~20 повідомлень/сек), щоб не впиратися в ліміти API
+            await asyncio.sleep(0.05)
+
+        except TelegramForbiddenError:
+            # Користувач заблокував бота
+            blocked_count += 1
+        except TelegramRetryAfter as e:
+            # Якщо Telegram просить зачекати через ліміти
+            await asyncio.sleep(e.retry_after)
+            try:
+                await bot.send_message(chat_id=user_tg_id, text=text_to_send, parse_mode="HTML")
+                success_count += 1
+            except Exception:
+                pass
+        except Exception as e:
+            logging.warning(f"Не вдалося надіслати {user_tg_id}: {e}")
+
+    await status_msg.edit_text(
+        f"✅ <b>Розсилку завершено!</b>\n\n"
+        f"• Успішно надіслано: <b>{success_count}</b>\n"
+        f"• Заблокували бота: <b>{blocked_count}</b>",
+        parse_mode="HTML"
+    )
 
 @web.middleware
 async def cors_middleware(request: web.Request, handler):
