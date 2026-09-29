@@ -6,6 +6,7 @@ import asyncio
 import logging
 from urllib.parse import parse_qsl
 from dotenv import load_dotenv
+from datetime import datetime, timedelta, timezone
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -281,6 +282,117 @@ async def cmd_balance(message: Message):
     text += f"\n💰 <b>Загальний баланс: {total:,.2f} UAH</b>"
     await message.answer(text, parse_mode="HTML")
 
+# --- ДОДАТКОВІ ЕНДПОІНТИ КЕРУВАННЯ ТА АНАЛІТИКИ ---
+
+async def handle_create_account(request: web.Request):
+    """Створення нового рахунку (картка, готівка, депозит)"""
+    try:
+        data = await request.json()
+        user_id = data.get("userId")
+        name = data.get("name")
+        acc_type = data.get("type", "card")
+        balance = float(data.get("balance", 0.0))
+        currency = data.get("currency", "UAH")
+
+        if not user_id or not name:
+            return web.json_response({"error": "Missing fields"}, status=400)
+
+        res = supabase.table("accounts").insert({
+            "user_id": user_id,
+            "name": name,
+            "type": acc_type,
+            "balance": balance,
+            "currency": currency
+        }).execute()
+
+        return web.json_response({"status": "success", "account": res.data[0]})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_create_investment(request: web.Request):
+    """Додавання інвестиційного активу"""
+    try:
+        data = await request.json()
+        user_id = data.get("userId")
+        ticker = data.get("ticker_or_name")
+        asset_type = data.get("asset_type", "stock")
+        quantity = float(data.get("quantity", 0))
+        buy_price = float(data.get("buy_price_avg", 0))
+        current_price = float(data.get("current_price", buy_price))
+        currency = data.get("currency", "USD")
+
+        if not user_id or not ticker:
+            return web.json_response({"error": "Missing fields"}, status=400)
+
+        res = supabase.table("investment_assets").insert({
+            "user_id": user_id,
+            "ticker_or_name": ticker,
+            "asset_type": asset_type,
+            "quantity": quantity,
+            "buy_price_avg": buy_price,
+            "current_price": current_price,
+            "currency": currency
+        }).execute()
+
+        return web.json_response({"status": "success", "asset": res.data[0]})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_analytics_and_forecast(request: web.Request):
+    """Аналіз за обраний період (дні) та прогноз на наступні N днів на базі історії"""
+    try:
+        user_id = int(request.query.get("user_id"))
+        days_back = int(request.query.get("days", 30))
+        forecast_days = int(request.query.get("forecast_days", 30))
+
+        since_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+
+        # Отримуємо транзакції за обраний історичний інтервал
+        res = supabase.table("transactions")\
+            .select("amount, type, description, created_at")\
+            .eq("user_id", user_id)\
+            .gte("created_at", since_date)\
+            .execute()
+
+        transactions = res.data
+
+        total_income = sum(float(t["amount"]) for t in transactions if t["type"] == "income")
+        total_expense = sum(float(t["amount"]) for t in transactions if t["type"] == "expense")
+
+        # Середньодобові темпи (Run-rate)
+        daily_income_avg = total_income / max(days_back, 1)
+        daily_expense_avg = total_expense / max(days_back, 1)
+
+        # Прогноз на наступний період
+        projected_income = round(daily_income_avg * forecast_days, 2)
+        projected_expense = round(daily_expense_avg * forecast_days, 2)
+        projected_net_savings = round(projected_income - projected_expense, 2)
+
+        # Поточний залишок на рахунках
+        accs = supabase.table("accounts").select("balance").eq("user_id", user_id).execute()
+        current_liquidity = sum(float(a["balance"]) for a in accs.data)
+        projected_end_balance = round(current_liquidity + projected_net_savings, 2)
+
+        # Розрахунок Runway (на скільки днів вистачить коштів при поточному темпі витрат)
+        runway_days = round(current_liquidity / daily_expense_avg) if daily_expense_avg > 0 else 999
+
+        return web.json_response({
+            "history_period_days": days_back,
+            "forecast_period_days": forecast_days,
+            "historical_income": total_income,
+            "historical_expense": total_expense,
+            "daily_burn_rate": round(daily_expense_avg, 2),
+            "projected_income": projected_income,
+            "projected_expense": projected_expense,
+            "projected_savings": projected_net_savings,
+            "projected_end_balance": projected_end_balance,
+            "runway_days": runway_days
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
 # --- СТАРТ СЕРВЕРА ТА БОТА ---
 async def main():
     app = web.Application(middlewares=[cors_middleware])
@@ -288,6 +400,9 @@ async def main():
     app.router.add_get("/health", handle_health)
     app.router.add_get("/api/dashboard", handle_get_dashboard)
     app.router.add_post("/api/transaction", handle_add_transaction)
+    app.router.add_post("/api/account", handle_create_account)
+    app.router.add_post("/api/investment", handle_create_investment)
+    app.router.add_get("/api/analytics", handle_analytics_and_forecast)
 
     runner = web.AppRunner(app)
     await runner.setup()
