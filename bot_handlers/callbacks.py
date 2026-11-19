@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timezone, date
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -5,6 +6,9 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardBut
 from db import supabase, run_db, get_user_uuid_by_tg_id, apply_tx_balance_effect_sync, create_transaction_atomic
 
 router = Router()
+
+# Short-token map so callback_data stays well under Telegram's 64-byte limit
+_CAT_PICK_MAP: dict[str, tuple[str, str]] = {}
 
 
 @router.callback_query(F.data.startswith("undo_tx:"))
@@ -55,7 +59,11 @@ async def cb_pick_cat(callback: CallbackQuery):
     rows = []
     row = []
     for c in cats[:12]:
-        row.append(InlineKeyboardButton(text=f"{c.get('icon', '')} {c['name']}", callback_data=f"set_cat:{tx_id}:{c['id']}"))
+        token = uuid.uuid4().hex[:10]
+        if len(_CAT_PICK_MAP) > 500:
+            _CAT_PICK_MAP.pop(next(iter(_CAT_PICK_MAP)))
+        _CAT_PICK_MAP[token] = (tx_id, c["id"])
+        row.append(InlineKeyboardButton(text=f"{c.get('icon', '')} {c['name']}", callback_data=f"sc:{token}"))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -66,9 +74,14 @@ async def cb_pick_cat(callback: CallbackQuery):
     await callback.answer("Оберіть категорію")
 
 
-@router.callback_query(F.data.startswith("set_cat:"))
+@router.callback_query(F.data.startswith("sc:"))
 async def cb_set_cat(callback: CallbackQuery):
-    _, tx_id, cat_id = callback.data.split(":", 2)
+    token = callback.data.split(":", 1)[1]
+    pair = _CAT_PICK_MAP.pop(token, None)
+    if not pair:
+        await callback.answer("Термін вибору минув, спробуйте ще раз", show_alert=True)
+        return
+    tx_id, cat_id = pair
     user_uuid = await get_user_uuid_by_tg_id(callback.from_user.id)
     if not user_uuid:
         return
