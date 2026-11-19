@@ -70,7 +70,21 @@ CREATE TABLE IF NOT EXISTS price_alerts (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 6. Atomic transaction creation RPC
+-- 6. Debts / Loans tracker
+CREATE TABLE IF NOT EXISTS debts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  direction TEXT NOT NULL CHECK (direction IN ('owed_to_me', 'i_owe')),
+  person_name TEXT NOT NULL,
+  amount NUMERIC(14, 2) NOT NULL CHECK (amount > 0),
+  currency TEXT NOT NULL DEFAULT 'UAH',
+  note TEXT DEFAULT '',
+  due_date DATE,
+  is_settled BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 7. Atomic transaction creation RPC
 CREATE OR REPLACE FUNCTION create_transaction_atomic(
   p_user_id UUID,
   p_account_id UUID,

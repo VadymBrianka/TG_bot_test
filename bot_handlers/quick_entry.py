@@ -17,11 +17,11 @@ from services.receipt_ai import parse_receipt_bytes, match_category_id
 router = Router()
 
 INCOME_RE = re.compile(
-    r"^\+\s*(\d+(?:[.,]\d+)?)\s*(UAH|USD|EUR|GBP|PLN|грн|\$|€)?\s*(.*)$",
+    r"^\+\s*(\d+(?:[.,]\d+)?)\s*(UAH|USD|EUR|GBP|PLN|USDT|грн|\$|€)?\s*(.*)$",
     re.IGNORECASE,
 )
 EXPENSE_RE = re.compile(
-    r"^\s*([^\d\n][^\n]*?)\s+(\d+(?:[.,]\d+)?)\s*(UAH|USD|EUR|GBP|PLN|грн|\$|€)?\s*$",
+    r"^\s*([^\d\n][^\n]*?)\s+(\d+(?:[.,]\d+)?)\s*(UAH|USD|EUR|GBP|PLN|USDT|грн|\$|€)?\s*$",
     re.IGNORECASE,
 )
 

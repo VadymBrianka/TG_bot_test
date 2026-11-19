@@ -56,6 +56,8 @@ async def get_exchange_rates() -> dict[str, float]:
             if r.get("currency") and r.get("currency") != "USDT"
         }
         rates["UAH"] = 1.0
+        if "USD" in rates:
+            rates["USDT"] = rates["USD"]
         return rates
     return await run_db(_q)
 

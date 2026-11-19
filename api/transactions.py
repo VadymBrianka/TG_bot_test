@@ -1,6 +1,6 @@
 import logging
 from aiohttp import web
-from db import supabase, run_db, create_transaction_atomic, apply_tx_balance_effect_sync
+from db import supabase, run_db, create_transaction_atomic, apply_tx_balance_effect_sync, get_exchange_rates
 from schemas import TransactionCreate, TransactionUpdate, parse_json_body
 from services.budget_alerts import check_budget_threshold
 
@@ -79,15 +79,42 @@ async def handle_create_transaction(request: web.Request):
         return web.json_response({"error": "Оберіть два різних рахунки для переказу"}, status=400)
 
     try:
+        final_amount = body.amount
+        final_note = body.note
+
+        if body.currency and body.type in ("expense", "income"):
+            acc_res = await run_db(
+                lambda: supabase.table("accounts")
+                .select("currency")
+                .eq("id", body.account_id)
+                .eq("user_id", user_uuid)
+                .limit(1)
+                .execute()
+                .data
+            )
+            if not acc_res:
+                return web.json_response({"error": "Рахунок не знайдено"}, status=404)
+            acc_curr = str(acc_res[0].get("currency") or "UAH").upper()
+            tx_curr = body.currency.upper()
+            if tx_curr != acc_curr:
+                rates = await get_exchange_rates()
+                r_tx = rates.get(tx_curr, 1.0)
+                r_acc = rates.get(acc_curr, 1.0)
+                final_amount = round(body.amount * (r_tx / r_acc), 4)
+                if final_amount >= 0.01:
+                    final_amount = round(final_amount, 2)
+                suffix = f"({body.amount:g} {tx_curr})"
+                final_note = f"{final_note} {suffix}".strip() if final_note else suffix
+
         tx = await create_transaction_atomic(
             user_uuid=user_uuid,
             account_id=body.account_id,
             to_account_id=body.to_account_id,
             category_id=category_id,
-            amount=body.amount,
+            amount=final_amount,
             target_amount=body.target_amount if body.type == "transfer" else None,
             tx_type=body.type,
-            note=body.note,
+            note=final_note,
             transaction_date=body.transaction_date,
         )
         if body.type == "expense" and category_id:

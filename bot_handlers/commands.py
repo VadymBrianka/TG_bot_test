@@ -15,6 +15,9 @@ USER_COMMANDS = [
     BotCommand(command="balance", description="Залишки на рахунках"),
     BotCommand(command="today", description="Доходи та витрати за сьогодні"),
     BotCommand(command="month", description="Фінансовий звіт за місяць"),
+    BotCommand(command="stats", description="Топ-5 категорій витрат за місяць"),
+    BotCommand(command="debts", description="Борги та позики"),
+    BotCommand(command="debt", description="Додати борг: /debt мені Олег 500 UAH"),
     BotCommand(command="goals", description="Мої цілі накопичення"),
     BotCommand(command="portfolio", description="Активи, депозити та ОВДП"),
     BotCommand(command="budgets", description="Місячні ліміти (бюджети)"),
@@ -472,3 +475,121 @@ async def cmd_export(message: Message):
     filename = f"fintrack_export_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"
     doc = BufferedInputFile(csv_text.encode("utf-8"), filename=filename)
     await message.answer_document(doc, caption="📊 <b>Ваш експорт транзакцій за останні 365 днів</b>", parse_mode="HTML")
+
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not message.from_user:
+        return
+    user_uuid = await get_user_uuid_by_tg_id(message.from_user.id)
+    if not user_uuid:
+        return
+
+    month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+    def _load():
+        txs = (
+            supabase.table("transactions")
+            .select("amount, category_id, account_id")
+            .eq("user_id", user_uuid)
+            .eq("type", "expense")
+            .gte("transaction_date", month_start)
+            .execute()
+            .data
+            or []
+        )
+        accs = supabase.table("accounts").select("id, currency").eq("user_id", user_uuid).execute().data or []
+        cats = supabase.table("categories").select("id, name, icon").execute().data or []
+        return txs, accs, cats
+
+    txs, accs, cats = await run_db(_load)
+    if not txs:
+        await message.answer("📊 За цей місяць витрат ще немає.")
+        return
+
+    rates = await get_exchange_rates()
+    acc_curr = {a["id"]: str(a.get("currency") or "UAH").upper() for a in accs}
+    cat_map = {c["id"]: c for c in cats}
+
+    by_cat: dict[str, float] = {}
+    total_uah = 0.0
+    for t in txs:
+        uah = float(t["amount"]) * rates.get(acc_curr.get(t.get("account_id"), "UAH"), 1.0)
+        total_uah += uah
+        cid = t.get("category_id") or "other"
+        by_cat[cid] = by_cat.get(cid, 0.0) + uah
+
+    top = sorted(by_cat.items(), key=lambda x: x[1], reverse=True)[:5]
+    lines = ["🏆 <b>Топ-5 категорій витрат за місяць (UAH):</b>\n"]
+    for cid, val in top:
+        c = cat_map.get(cid, {"name": "Інше", "icon": "⚪"})
+        pct = round((val / (total_uah or 1)) * 100)
+        lines.append(f"• {c.get('icon', '🏷️')} <b>{c['name']}</b>: {val:,.0f} UAH (<b>{pct}%</b>)")
+    lines.append(f"\n💸 <b>Всього витрачено: {total_uah:,.0f} UAH</b>")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("debts"))
+async def cmd_debts(message: Message):
+    if not message.from_user:
+        return
+    user_uuid = await get_user_uuid_by_tg_id(message.from_user.id)
+    if not user_uuid:
+        return
+    try:
+        rows = await run_db(
+            lambda: supabase.table("debts")
+            .select("*")
+            .eq("user_id", user_uuid)
+            .eq("is_settled", False)
+            .order("created_at", desc=True)
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            await message.answer("🤝 Активних боргів немає.\nДодати: <code>/debt мені Олег 500 UAH</code>", parse_mode="HTML")
+            return
+        lines = ["🤝 <b>Активні борги та позики:</b>\n"]
+        for d in rows:
+            badge = "🟢 Вам винні:" if d["direction"] == "owed_to_me" else "🔴 Ви винні:"
+            note = f" — <i>{d['note']}</i>" if d.get("note") else ""
+            lines.append(f"{badge} <b>{d['person_name']}</b> — <b>{float(d['amount']):,.2f} {d['currency']}</b>{note}")
+        await message.answer("\n".join(lines), parse_mode="HTML")
+    except Exception:
+        await message.answer("⚠️ Таблиця <code>debts</code> ще не створена в БД (виконайте <code>migrations.sql</code>).", parse_mode="HTML")
+
+
+@router.message(Command("debt"))
+async def cmd_add_debt(message: Message):
+    if not message.from_user:
+        return
+    user_uuid = await get_user_uuid_by_tg_id(message.from_user.id)
+    if not user_uuid:
+        return
+    parts = (message.text or "").split(maxsplit=5)
+    if len(parts) < 4:
+        await message.reply("Формат: <code>/debt мені Олег 500 [UAH] [примітка]</code> або <code>/debt я Аня 200</code>", parse_mode="HTML")
+        return
+
+    dir_word = parts[1].lower()
+    direction = "owed_to_me" if dir_word in ("мені", "мне", "me", "+") else "i_owe"
+    person = parts[2]
+    try:
+        amount = float(parts[3].replace(",", "."))
+    except ValueError:
+        await message.reply("Сума має бути числом.")
+        return
+    curr = parts[4].upper() if len(parts) > 4 and len(parts[4]) <= 5 and parts[4].isalpha() else "UAH"
+    note = parts[5] if len(parts) > 5 else (parts[4] if len(parts) > 4 and curr == "UAH" and not parts[4].isalpha() else "")
+
+    try:
+        await run_db(
+            lambda: supabase.table("debts")
+            .insert({"user_id": user_uuid, "direction": direction, "person_name": person, "amount": amount, "currency": curr, "note": note})
+            .execute()
+        )
+        label = "Вам винен" if direction == "owed_to_me" else "Ви винні"
+        await message.reply(f"🤝 Записано! {label} <b>{person}</b>: <b>{amount:,.2f} {curr}</b>", parse_mode="HTML")
+    except Exception as e:
+        await message.reply(f"❌ Помилка: {e}")

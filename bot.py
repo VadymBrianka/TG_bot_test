@@ -54,8 +54,10 @@ from api.admin import (
     handle_admin_ban_user,
     handle_admin_broadcast,
     handle_admin_refresh_rates,
+    handle_admin_send_dm,
 )
 from api.receipts import handle_parse_receipt
+from api.debts import handle_list_debts, handle_create_debt, handle_settle_debt, handle_delete_debt
 
 from bot_handlers import admin, commands, quick_entry, callbacks
 
@@ -136,10 +138,17 @@ def create_web_app() -> web.Application:
     # Receipts AI
     app.router.add_post("/api/v1/receipts/parse", handle_parse_receipt)
 
+    # Debts
+    app.router.add_get("/api/v1/debts", handle_list_debts)
+    app.router.add_post("/api/v1/debts", handle_create_debt)
+    app.router.add_post("/api/v1/debts/{id}/settle", handle_settle_debt)
+    app.router.add_delete("/api/v1/debts/{id}", handle_delete_debt)
+
     # Admin
     app.router.add_get("/api/v1/admin/overview", handle_admin_overview)
     app.router.add_put("/api/v1/admin/users/{id}/role", handle_admin_set_role)
     app.router.add_put("/api/v1/admin/users/{id}/ban", handle_admin_ban_user)
+    app.router.add_post("/api/v1/admin/users/{id}/dm", handle_admin_send_dm)
     app.router.add_post("/api/v1/admin/broadcast", handle_admin_broadcast)
     app.router.add_post("/api/v1/admin/refresh-rates", handle_admin_refresh_rates)
 

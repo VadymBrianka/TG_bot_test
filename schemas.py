@@ -20,9 +20,17 @@ class TransactionCreate(BaseModel):
     category_id: Optional[str] = None
     amount: float = Field(..., gt=0)
     target_amount: Optional[float] = Field(default=None, gt=0)
+    currency: Optional[str] = None
     type: Literal["expense", "income", "transfer"] = "expense"
     note: str = Field(default="", max_length=500)
     transaction_date: Optional[str] = None
+
+    @field_validator("currency")
+    @classmethod
+    def check_tx_currency(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or not v.strip():
+            return None
+        return _clean_currency(v)
 
 
 class TransactionUpdate(BaseModel):
@@ -190,6 +198,20 @@ class CsvImportItem(BaseModel):
 class CsvImportRequest(BaseModel):
     account_id: str = Field(..., min_length=1)
     items: list[CsvImportItem] = Field(..., min_length=1, max_length=500)
+
+
+class DebtCreate(BaseModel):
+    direction: Literal["owed_to_me", "i_owe"]
+    person_name: str = Field(..., min_length=1, max_length=120)
+    amount: float = Field(..., gt=0)
+    currency: str = Field(default="UAH")
+    note: str = Field(default="", max_length=300)
+    due_date: Optional[str] = None
+
+    @field_validator("currency")
+    @classmethod
+    def check_debt_currency(cls, v: str) -> str:
+        return _clean_currency(v)
 
 
 async def parse_json_body(request: web.Request, model_cls: type[BaseModel]):

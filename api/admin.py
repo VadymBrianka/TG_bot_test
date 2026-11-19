@@ -1,10 +1,11 @@
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from aiohttp import web
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 
-from config import MINIAPP_URL
+from config import MINIAPP_URL, GEMINI_API_KEY
 from db import supabase, run_db, is_admin
 from services.nbu import update_rates_from_nbu
 
@@ -28,6 +29,23 @@ async def handle_admin_overview(request: web.Request):
         inv_cnt = supabase.table("investments").select("id", count="exact").limit(1).execute().count or 0
         rates_cnt = supabase.table("exchange_rates").select("currency", count="exact").limit(1).execute().count or 0
 
+        now = datetime.now(timezone.utc)
+        d1 = (now - timedelta(days=1)).isoformat()
+        d7 = (now - timedelta(days=7)).isoformat()
+        d30 = (now - timedelta(days=30)).isoformat()
+        recent_txs = (
+            supabase.table("transactions")
+            .select("user_id, transaction_date")
+            .gte("transaction_date", d30)
+            .execute()
+            .data
+            or []
+        )
+        dau = len({t["user_id"] for t in recent_txs if (t.get("transaction_date") or "") >= d1})
+        wau = len({t["user_id"] for t in recent_txs if (t.get("transaction_date") or "") >= d7})
+        mau = len({t["user_id"] for t in recent_txs})
+        tx_7d = sum(1 for t in recent_txs if (t.get("transaction_date") or "") >= d7)
+
         try:
             b_logs = (
                 supabase.table("broadcast_logs")
@@ -49,6 +67,11 @@ async def handle_admin_overview(request: web.Request):
                 "goals_count": goal_cnt,
                 "investments_count": inv_cnt,
                 "rates_count": rates_cnt,
+                "dau": dau,
+                "wau": wau,
+                "mau": mau,
+                "tx_7d": tx_7d,
+                "gemini_configured": bool(GEMINI_API_KEY),
             },
             "users": [
                 {
@@ -211,3 +234,35 @@ async def handle_admin_refresh_rates(request: web.Request):
         return denied
     await update_rates_from_nbu()
     return web.json_response({"status": "refreshed"})
+
+
+async def handle_admin_send_dm(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+
+    target_user_id = request.match_info.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    text = str(body.get("text", "")).strip()
+    if not text:
+        return web.json_response({"error": "Повідомлення порожнє"}, status=400)
+
+    bot = request.app.get("bot")
+    if not bot:
+        return web.json_response({"error": "Bot unavailable"}, status=500)
+
+    rows = await run_db(
+        lambda: supabase.table("users").select("telegram_id").eq("id", target_user_id).limit(1).execute().data
+    )
+    if not rows or not rows[0].get("telegram_id"):
+        return web.json_response({"error": "Користувача не знайдено"}, status=404)
+
+    try:
+        await bot.send_message(chat_id=rows[0]["telegram_id"], text=text, parse_mode="HTML")
+        return web.json_response({"status": "sent"})
+    except Exception as e:
+        return web.json_response({"error": f"Не вдалося надіслати: {e}"}, status=502)

@@ -5,6 +5,8 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 
+from datetime import datetime, timedelta, timezone
+from config import GEMINI_API_KEY
 from db import supabase, run_db, is_admin
 from services.nbu import update_rates_from_nbu
 
@@ -16,10 +18,14 @@ def _admin_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats"),
-                InlineKeyboardButton(text="👥 Користувачі", callback_data="adm:users"),
+                InlineKeyboardButton(text="📈 DAU/MAU", callback_data="adm:activity"),
             ],
             [
-                InlineKeyboardButton(text="🔄 Оновити курси НБУ", callback_data="adm:rates"),
+                InlineKeyboardButton(text="👥 Користувачі", callback_data="adm:users"),
+                InlineKeyboardButton(text="🏥 Стан системи", callback_data="adm:health"),
+            ],
+            [
+                InlineKeyboardButton(text="🔄 Курси НБУ", callback_data="adm:rates"),
                 InlineKeyboardButton(text="📢 Розсилка", callback_data="adm:bcast"),
             ],
         ]
@@ -89,6 +95,44 @@ async def cb_admin_panel(callback: CallbackQuery):
     elif action == "bcast":
         await callback.message.answer(
             "📢 Для розсилки надішліть команду:\n<code>/broadcast Ваш текст повідомлення</code>",
+            parse_mode="HTML",
+        )
+        await callback.answer()
+
+    elif action == "activity":
+        now = datetime.now(timezone.utc)
+        d1 = (now - timedelta(days=1)).isoformat()
+        d7 = (now - timedelta(days=7)).isoformat()
+        d30 = (now - timedelta(days=30)).isoformat()
+        txs = await run_db(
+            lambda: supabase.table("transactions").select("user_id, transaction_date").gte("transaction_date", d30).execute().data or []
+        )
+        dau = len({t["user_id"] for t in txs if (t.get("transaction_date") or "") >= d1})
+        wau = len({t["user_id"] for t in txs if (t.get("transaction_date") or "") >= d7})
+        mau = len({t["user_id"] for t in txs})
+        tx7 = sum(1 for t in txs if (t.get("transaction_date") or "") >= d7)
+        await callback.message.edit_text(
+            f"📈 <b>Активність користувачів:</b>\n\n"
+            f"• DAU (24 год): <b>{dau}</b>\n"
+            f"• WAU (7 днів): <b>{wau}</b>\n"
+            f"• MAU (30 днів): <b>{mau}</b>\n"
+            f"• Операцій за 7 днів: <b>{tx7}</b>",
+            reply_markup=_admin_keyboard(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+
+    elif action == "health":
+        rates_cnt = await run_db(
+            lambda: supabase.table("exchange_rates").select("currency", count="exact").limit(1).execute().count or 0
+        )
+        ai_status = "✅ Підключено" if GEMINI_API_KEY else "⚠️ Не задано GEMINI_API_KEY"
+        await callback.message.edit_text(
+            f"🏥 <b>Стан системи:</b>\n\n"
+            f"• База даних Supabase: <b>✅ Активна</b>\n"
+            f"• Курсів валют НБУ: <b>{rates_cnt}</b>\n"
+            f"• ШІ-сканер чеків: <b>{ai_status}</b>",
+            reply_markup=_admin_keyboard(),
             parse_mode="HTML",
         )
         await callback.answer()
