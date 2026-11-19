@@ -1,6 +1,6 @@
 import logging
 from aiohttp import web
-from db import supabase, run_db, get_exchange_rates
+from db import supabase, run_db, get_exchange_rates, get_user_role
 
 
 async def handle_health(request: web.Request):
@@ -80,8 +80,11 @@ async def handle_dashboard_summary(request: web.Request):
         total_goals_uah = sum(float(g["current_amount"]) * rates.get(str(g.get("currency", "UAH")).upper(), 1.0) for g in goals)
         net_worth = total_accounts_uah + total_investments_uah + total_goals_uah
 
+        role = await get_user_role(request["tg_id"])
+
         return web.json_response(
             {
+                "role": role,
                 "accounts": accs,
                 "investments": invs,
                 "goals": goals,

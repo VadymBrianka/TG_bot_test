@@ -2,10 +2,12 @@ import asyncio
 import logging
 from aiohttp import web
 from aiogram import Bot, Dispatcher
+from aiogram.types import BotCommandScopeChat
 
-from config import BOT_TOKEN, SERVER_PORT
+from config import BOT_TOKEN, SERVER_PORT, ADMIN_ID
 from middlewares.auth import cors_middleware, auth_middleware
 from services.scheduler import start_scheduler
+from bot_handlers.commands import USER_COMMANDS, ADMIN_EXTRA_COMMANDS
 
 from api.dashboard import handle_health, handle_get_currencies, handle_dashboard_summary
 from api.transactions import (
@@ -43,7 +45,14 @@ from api.features import (
     handle_delete_alert,
     handle_update_settings,
     handle_export_csv,
+    handle_export_send_telegram,
     handle_import_csv,
+)
+from api.admin import (
+    handle_admin_overview,
+    handle_admin_set_role,
+    handle_admin_broadcast,
+    handle_admin_refresh_rates,
 )
 
 from bot_handlers import admin, commands, quick_entry, callbacks
@@ -119,7 +128,14 @@ def create_web_app() -> web.Application:
 
     app.router.add_put("/api/v1/settings", handle_update_settings)
     app.router.add_get("/api/v1/export/csv", handle_export_csv)
+    app.router.add_post("/api/v1/export/send-telegram", handle_export_send_telegram)
     app.router.add_post("/api/v1/import/csv", handle_import_csv)
+
+    # Admin
+    app.router.add_get("/api/v1/admin/overview", handle_admin_overview)
+    app.router.add_put("/api/v1/admin/users/{id}/role", handle_admin_set_role)
+    app.router.add_post("/api/v1/admin/broadcast", handle_admin_broadcast)
+    app.router.add_post("/api/v1/admin/refresh-rates", handle_admin_refresh_rates)
 
     return app
 
@@ -135,6 +151,14 @@ async def main():
     logging.info(f"API сервер запущено на порті {SERVER_PORT}...")
 
     await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await bot.set_my_commands(USER_COMMANDS)
+        await bot.set_my_commands(
+            USER_COMMANDS + ADMIN_EXTRA_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=ADMIN_ID),
+        )
+    except Exception as e:
+        logging.warning(f"Failed to set bot commands: {e}")
     await dp.start_polling(bot)
 
 

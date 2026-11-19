@@ -1,8 +1,8 @@
-import csv
-import io
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timezone, date
 from aiohttp import web
+from aiogram.types import BufferedInputFile
 from db import supabase, run_db, get_exchange_rates, create_transaction_atomic
+from services.export_csv import build_transactions_csv
 from schemas import (
     BudgetCreate,
     RecurringCreate,
@@ -273,50 +273,34 @@ async def handle_update_settings(request: web.Request):
 
 async def handle_export_csv(request: web.Request):
     user_uuid: str = request["user_uuid"]
-    days = min(max(int(request.query.get("days", 90)), 1), 3650)
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-
-    def _load():
-        txs = (
-            supabase.table("transactions")
-            .select("transaction_date, type, amount, note, account_id, category_id")
-            .eq("user_id", user_uuid)
-            .gte("transaction_date", since)
-            .order("transaction_date", desc=True)
-            .execute()
-            .data
-            or []
-        )
-        accs = supabase.table("accounts").select("id, name, currency").eq("user_id", user_uuid).execute().data or []
-        cats = supabase.table("categories").select("id, name").execute().data or []
-        return txs, {a["id"]: a for a in accs}, {c["id"]: c["name"] for c in cats}
-
-    txs, acc_map, cat_map = await run_db(_load)
-
-    buf = io.StringIO()
-    buf.write("\ufeff")  # UTF-8 BOM for Excel
-    writer = csv.writer(buf)
-    writer.writerow(["Дата", "Тип", "Сума", "Валюта", "Рахунок", "Категорія", "Нотатка"])
-    for t in txs:
-        acc = acc_map.get(t.get("account_id"), {})
-        writer.writerow(
-            [
-                t.get("transaction_date", ""),
-                t.get("type", ""),
-                t.get("amount", 0),
-                acc.get("currency", "UAH"),
-                acc.get("name", ""),
-                cat_map.get(t.get("category_id"), "Інше"),
-                t.get("note", ""),
-            ]
-        )
-
+    days = min(max(int(request.query.get("days", 365)), 1), 3650)
+    csv_text = await build_transactions_csv(user_uuid, days=days)
     return web.Response(
-        text=buf.getvalue(),
+        text=csv_text,
         content_type="text/csv",
         charset="utf-8",
         headers={"Content-Disposition": 'attachment; filename="fintrack_export.csv"'},
     )
+
+
+async def handle_export_send_telegram(request: web.Request):
+    user_uuid: str = request["user_uuid"]
+    tg_id: int = request["tg_id"]
+    bot = request.app.get("bot")
+    if not bot:
+        return web.json_response({"error": "Bot instance unavailable"}, status=500)
+
+    days = min(max(int(request.query.get("days", 365)), 1), 3650)
+    csv_text = await build_transactions_csv(user_uuid, days=days)
+    filename = f"fintrack_export_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"
+    doc = BufferedInputFile(csv_text.encode("utf-8"), filename=filename)
+    await bot.send_document(
+        chat_id=tg_id,
+        document=doc,
+        caption=f"📊 <b>Експорт транзакцій за {days} дн.</b>",
+        parse_mode="HTML",
+    )
+    return web.json_response({"status": "sent", "filename": filename})
 
 
 async def handle_import_csv(request: web.Request):

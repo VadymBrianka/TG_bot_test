@@ -2,11 +2,15 @@
 -- Run this in Supabase SQL Editor to enable atomic transactions, custom categories,
 -- budgets, recurring payments, price alerts, and user preferences.
 
--- 1. Extend users table with preferences
+-- 1. Extend users table with preferences and role
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS default_account_id UUID REFERENCES accounts(id) ON DELETE SET NULL,
   ADD COLUMN IF NOT EXISTS weekly_digest BOOLEAN DEFAULT TRUE,
-  ADD COLUMN IF NOT EXISTS notifications_enabled BOOLEAN DEFAULT TRUE;
+  ADD COLUMN IF NOT EXISTS notifications_enabled BOOLEAN DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
+
+-- Optional: grant admin role to the primary admin
+-- UPDATE users SET role = 'admin' WHERE telegram_id = 464800908;
 
 -- 2. Extend categories table for custom user categories
 ALTER TABLE categories

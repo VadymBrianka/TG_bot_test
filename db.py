@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar
 from supabase import create_client, Client
 
-from config import SUPABASE_URL, SUPABASE_KEY
+from config import SUPABASE_URL, SUPABASE_KEY, ADMIN_ID
 
 T = TypeVar("T")
 
@@ -14,6 +14,23 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 async def run_db(fn: Callable[[], T]) -> T:
     """Execute a synchronous Supabase call in a worker thread without blocking the event loop."""
     return await asyncio.to_thread(fn)
+
+
+async def get_user_role(tg_id: int) -> str:
+    """Return user's role ('admin' or 'user'), falling back to ADMIN_ID if role column is missing."""
+    def _q():
+        try:
+            res = supabase.table("users").select("role").eq("telegram_id", tg_id).limit(1).execute()
+            if res.data and res.data[0].get("role"):
+                return str(res.data[0]["role"]).lower()
+        except Exception:
+            pass
+        return "admin" if tg_id == ADMIN_ID else "user"
+    return await run_db(_q)
+
+
+async def is_admin(tg_id: int) -> bool:
+    return (await get_user_role(tg_id)) == "admin"
 
 
 async def get_user_by_tg_id(tg_id: int) -> dict[str, Any] | None:
