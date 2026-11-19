@@ -313,7 +313,8 @@ async def handle_export_csv(request: web.Request):
 
     return web.Response(
         text=buf.getvalue(),
-        content_type="text/csv; charset=utf-8",
+        content_type="text/csv",
+        charset="utf-8",
         headers={"Content-Disposition": 'attachment; filename="fintrack_export.csv"'},
     )
 
