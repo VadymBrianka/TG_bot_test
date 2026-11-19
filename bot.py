@@ -126,7 +126,21 @@ async def cors_middleware(request: web.Request, handler):
     return response
 
 async def handle_health(request: web.Request):
-    return web.Response(text="FinTrack Engine is live! 🚀", status=200)
+    try:
+        # Виконуємо легкий запит до БД у фоновому потоці, щоб не блокувати event loop
+        await asyncio.to_thread(
+            lambda: supabase.table("exchange_rates").select("currency").limit(1).execute()
+        )
+        return web.json_response(
+            {"status": "ok", "db": "active", "message": "FinTrack Engine is live! 🚀"},
+            status=200
+        )
+    except Exception as e:
+        logging.error(f"Healthcheck DB error: {e}")
+        return web.json_response(
+            {"status": "degraded", "db": "error", "detail": str(e)},
+            status=500
+        )
 
 async def handle_get_currencies(request: web.Request):
     try:
