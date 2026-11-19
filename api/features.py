@@ -254,8 +254,16 @@ async def handle_update_settings(request: web.Request):
     payload = {}
     if body.default_account_id is not None:
         payload["default_account_id"] = body.default_account_id or None
+    if body.base_currency is not None:
+        payload["base_currency"] = body.base_currency
     if body.weekly_digest is not None:
         payload["weekly_digest"] = body.weekly_digest
+    if body.monthly_digest is not None:
+        payload["monthly_digest"] = body.monthly_digest
+    if body.budget_alerts_enabled is not None:
+        payload["budget_alerts_enabled"] = body.budget_alerts_enabled
+    if body.daily_reminder is not None:
+        payload["daily_reminder"] = body.daily_reminder
     if body.notifications_enabled is not None:
         payload["notifications_enabled"] = body.notifications_enabled
 

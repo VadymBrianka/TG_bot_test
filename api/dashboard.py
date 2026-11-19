@@ -93,7 +93,11 @@ async def handle_dashboard_summary(request: web.Request):
                 "exchange_rates": rates,
                 "settings": {
                     "default_account_id": user_row.get("default_account_id"),
+                    "base_currency": user_row.get("base_currency", "UAH"),
                     "weekly_digest": user_row.get("weekly_digest", True),
+                    "monthly_digest": user_row.get("monthly_digest", True),
+                    "budget_alerts_enabled": user_row.get("budget_alerts_enabled", True),
+                    "daily_reminder": user_row.get("daily_reminder", False),
                     "notifications_enabled": user_row.get("notifications_enabled", True),
                 },
                 "summary": {

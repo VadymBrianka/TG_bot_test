@@ -51,9 +51,11 @@ from api.features import (
 from api.admin import (
     handle_admin_overview,
     handle_admin_set_role,
+    handle_admin_ban_user,
     handle_admin_broadcast,
     handle_admin_refresh_rates,
 )
+from api.receipts import handle_parse_receipt
 
 from bot_handlers import admin, commands, quick_entry, callbacks
 
@@ -131,9 +133,13 @@ def create_web_app() -> web.Application:
     app.router.add_post("/api/v1/export/send-telegram", handle_export_send_telegram)
     app.router.add_post("/api/v1/import/csv", handle_import_csv)
 
+    # Receipts AI
+    app.router.add_post("/api/v1/receipts/parse", handle_parse_receipt)
+
     # Admin
     app.router.add_get("/api/v1/admin/overview", handle_admin_overview)
     app.router.add_put("/api/v1/admin/users/{id}/role", handle_admin_set_role)
+    app.router.add_put("/api/v1/admin/users/{id}/ban", handle_admin_ban_user)
     app.router.add_post("/api/v1/admin/broadcast", handle_admin_broadcast)
     app.router.add_post("/api/v1/admin/refresh-rates", handle_admin_refresh_rates)
 

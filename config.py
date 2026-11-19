@@ -11,6 +11,7 @@ SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
 ADMIN_ID: int = int(os.getenv("ADMIN_ID", "464800908"))
 ALLOW_INSECURE_TG_ID: bool = os.getenv("ALLOW_INSECURE_TG_ID", "false").lower() in ("1", "true", "yes")
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
 if not BOT_TOKEN or not MINIAPP_URL or not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Перевірте змінні середовища BOT_TOKEN, MINIAPP_URL, SUPABASE_URL та SUPABASE_KEY!")

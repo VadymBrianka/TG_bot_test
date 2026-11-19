@@ -7,7 +7,7 @@ from urllib.parse import parse_qsl
 from aiohttp import web
 
 from config import BOT_TOKEN, ALLOWED_ORIGINS, PRIMARY_ORIGIN, ALLOW_INSECURE_TG_ID
-from db import get_user_uuid_by_tg_id
+from db import get_user_by_tg_id
 
 PUBLIC_PATHS = {
     "/",
@@ -101,10 +101,12 @@ async def auth_middleware(request: web.Request, handler):
             status=401,
         )
 
-    user_uuid = await get_user_uuid_by_tg_id(tg_id)
-    if not user_uuid:
+    user = await get_user_by_tg_id(tg_id)
+    if not user:
         return web.json_response({"error": "User not found. Press /start in the bot first."}, status=404)
+    if user.get("is_banned"):
+        return web.json_response({"error": "Ваш акаунт заблоковано адміністратором."}, status=403)
 
     request["tg_id"] = tg_id
-    request["user_uuid"] = user_uuid
+    request["user_uuid"] = user["id"]
     return await handler(request)

@@ -1,3 +1,4 @@
+import io
 import re
 from aiogram import Router, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -11,6 +12,7 @@ from db import (
     create_transaction_atomic,
 )
 from services.budget_alerts import check_budget_threshold
+from services.receipt_ai import parse_receipt_bytes, match_category_id
 
 router = Router()
 
@@ -196,3 +198,60 @@ async def handle_quick_expense(message: Message):
     )
     if cat_id:
         await check_budget_threshold(message.bot, user_uuid, message.from_user.id, cat_id)
+
+
+@router.message(F.photo)
+async def handle_receipt_photo(message: Message):
+    if not message.from_user or not message.photo:
+        return
+    user_uuid = await get_user_uuid_by_tg_id(message.from_user.id)
+    if not user_uuid:
+        await message.answer("Спочатку натисніть /start")
+        return
+
+    status_msg = await message.reply("🤖 Аналізую чек через ШІ...")
+    try:
+        photo = message.photo[-1]
+        buf = io.BytesIO()
+        await message.bot.download(photo, destination=buf)
+        parsed = await parse_receipt_bytes(buf.getvalue(), mime_type="image/jpeg")
+
+        raw_amount = float(parsed["total_amount"])
+        explicit_curr = parsed.get("currency") or "UAH"
+        acc, final_amt, final_curr, suffix = await _pick_account_and_amount(user_uuid, raw_amount, explicit_curr)
+        if not acc:
+            await status_msg.edit_text("❌ У вас немає жодного рахунку. Створіть рахунок у Mini App.")
+            return
+
+        cat_id, cat_label = await match_category_id(parsed.get("category_hint", ""))
+        merchant = parsed.get("merchant") or "Чек"
+        items_summary = parsed.get("items_summary") or ""
+        note = f"🧾 {merchant}" + (f" ({items_summary})" if items_summary else "") + suffix
+
+        tx = await create_transaction_atomic(
+            user_uuid=user_uuid,
+            account_id=acc["id"],
+            to_account_id=None,
+            category_id=cat_id,
+            amount=final_amt,
+            target_amount=None,
+            tx_type="expense",
+            note=note[:450],
+        )
+        tx_id = tx.get("id", "")
+        kb = _tx_actions_keyboard(tx_id) if tx_id else None
+        await status_msg.edit_text(
+            f"🧾 <b>Чек розпізнано та записано!</b>\n"
+            f"🔴 Сума: <b>-{final_amt:,.2f} {final_curr}</b>\n"
+            f"🏪 Заклад: <b>{merchant}</b>\n"
+            f"💳 Рахунок: <i>{acc['name']}</i> | {cat_label}\n"
+            + (f"🛒 Позиції: <i>{items_summary}</i>" if items_summary else ""),
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        if cat_id:
+            await check_budget_threshold(message.bot, user_uuid, message.from_user.id, cat_id)
+    except ValueError as ve:
+        await status_msg.edit_text(f"⚠️ {ve}")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Не вдалося розпізнати чек: {e}")

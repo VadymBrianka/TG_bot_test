@@ -2,12 +2,28 @@
 -- Run this in Supabase SQL Editor to enable atomic transactions, custom categories,
 -- budgets, recurring payments, price alerts, and user preferences.
 
--- 1. Extend users table with preferences and role
+-- 1. Extend users table with preferences, base currency, and role
 ALTER TABLE users
   ADD COLUMN IF NOT EXISTS default_account_id UUID REFERENCES accounts(id) ON DELETE SET NULL,
+  ADD COLUMN IF NOT EXISTS base_currency TEXT NOT NULL DEFAULT 'UAH',
   ADD COLUMN IF NOT EXISTS weekly_digest BOOLEAN DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS monthly_digest BOOLEAN DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS budget_alerts_enabled BOOLEAN DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS daily_reminder BOOLEAN DEFAULT FALSE,
   ADD COLUMN IF NOT EXISTS notifications_enabled BOOLEAN DEFAULT TRUE,
-  ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
+  ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user',
+  ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE;
+
+-- Broadcast history table for admin panel
+CREATE TABLE IF NOT EXISTS broadcast_logs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  admin_tg_id BIGINT NOT NULL,
+  target_filter TEXT NOT NULL DEFAULT 'all',
+  message_text TEXT NOT NULL,
+  sent_count INT NOT NULL DEFAULT 0,
+  blocked_count INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
 
 -- Optional: grant admin role to the primary admin
 -- UPDATE users SET role = 'admin' WHERE telegram_id = 464800908;

@@ -1,8 +1,10 @@
 import asyncio
 import logging
 from aiohttp import web
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 
+from config import MINIAPP_URL
 from db import supabase, run_db, is_admin
 from services.nbu import update_rates_from_nbu
 
@@ -19,11 +21,26 @@ async def handle_admin_overview(request: web.Request):
         return denied
 
     def _load():
-        users = supabase.table("users").select("*", count="exact").order("telegram_id").limit(100).execute()
+        users = supabase.table("users").select("*", count="exact").order("telegram_id").limit(200).execute()
         tx_cnt = supabase.table("transactions").select("id", count="exact").limit(1).execute().count or 0
         acc_cnt = supabase.table("accounts").select("id", count="exact").limit(1).execute().count or 0
         goal_cnt = supabase.table("goals").select("id", count="exact").limit(1).execute().count or 0
         inv_cnt = supabase.table("investments").select("id", count="exact").limit(1).execute().count or 0
+        rates_cnt = supabase.table("exchange_rates").select("currency", count="exact").limit(1).execute().count or 0
+
+        try:
+            b_logs = (
+                supabase.table("broadcast_logs")
+                .select("*")
+                .order("created_at", desc=True)
+                .limit(10)
+                .execute()
+                .data
+                or []
+            )
+        except Exception:
+            b_logs = []
+
         return {
             "stats": {
                 "users_count": users.count if users.count is not None else len(users.data or []),
@@ -31,6 +48,7 @@ async def handle_admin_overview(request: web.Request):
                 "accounts_count": acc_cnt,
                 "goals_count": goal_cnt,
                 "investments_count": inv_cnt,
+                "rates_count": rates_cnt,
             },
             "users": [
                 {
@@ -39,9 +57,12 @@ async def handle_admin_overview(request: web.Request):
                     "username": u.get("username"),
                     "first_name": u.get("first_name"),
                     "role": u.get("role", "user"),
+                    "is_banned": bool(u.get("is_banned", False)),
+                    "base_currency": u.get("base_currency", "UAH"),
                 }
                 for u in (users.data or [])
             ],
+            "broadcast_logs": b_logs,
         }
 
     data = await run_db(_load)
@@ -74,6 +95,29 @@ async def handle_admin_set_role(request: web.Request):
         return web.json_response({"error": f"Не вдалося оновити роль (перевірте міграцію БД): {e}"}, status=400)
 
 
+async def handle_admin_ban_user(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+
+    target_user_id = request.match_info.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    is_banned = bool(body.get("is_banned", False))
+    try:
+        res = await run_db(
+            lambda: supabase.table("users").update({"is_banned": is_banned}).eq("id", target_user_id).execute()
+        )
+        if not res.data:
+            return web.json_response({"error": "Користувача не знайдено"}, status=404)
+        return web.json_response({"status": "updated", "is_banned": is_banned})
+    except Exception as e:
+        return web.json_response({"error": f"Не вдалося змінити статус блокування (перевірте міграцію БД): {e}"}, status=400)
+
+
 async def handle_admin_broadcast(request: web.Request):
     denied = await _require_admin(request)
     if denied:
@@ -88,19 +132,44 @@ async def handle_admin_broadcast(request: web.Request):
     if not text:
         return web.json_response({"error": "Текст розсилки порожній"}, status=400)
 
+    target = str(body.get("target", "all")).lower()  # all | admins | custom | self
+    custom_ids_raw = str(body.get("custom_ids", ""))
+    button_text = str(body.get("button_text", "")).strip()
+    button_url = str(body.get("button_url", "")).strip()
+    attach_miniapp_btn = bool(body.get("attach_miniapp_btn", False))
+    preview_self = bool(body.get("preview_self", False))
+
     bot = request.app.get("bot")
     if not bot:
         return web.json_response({"error": "Bot unavailable"}, status=500)
 
-    users = await run_db(lambda: supabase.table("users").select("telegram_id").execute().data or [])
+    reply_markup = None
+    if button_text and button_url:
+        reply_markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text=button_text, url=button_url)]]
+        )
+    elif attach_miniapp_btn and MINIAPP_URL:
+        reply_markup = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="📊 Відкрити FinTrack Hub", web_app=WebAppInfo(url=MINIAPP_URL))]]
+        )
+
+    if preview_self or target == "self":
+        tg_ids = [request["tg_id"]]
+    elif target == "custom":
+        tg_ids = [int(x.strip()) for x in custom_ids_raw.split(",") if x.strip().isdigit()]
+    else:
+        def _load_users():
+            rows = supabase.table("users").select("telegram_id, role, is_banned").execute().data or []
+            if target == "admins":
+                return [u["telegram_id"] for u in rows if u.get("telegram_id") and u.get("role") == "admin"]
+            return [u["telegram_id"] for u in rows if u.get("telegram_id") and not u.get("is_banned")]
+        tg_ids = await run_db(_load_users)
+
     sent = 0
     blocked = 0
-    for u in users:
-        tg_id = u.get("telegram_id")
-        if not tg_id:
-            continue
+    for tg_id in tg_ids:
         try:
-            await bot.send_message(chat_id=tg_id, text=text, parse_mode="HTML")
+            await bot.send_message(chat_id=tg_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
             sent += 1
             await asyncio.sleep(0.05)
         except TelegramForbiddenError:
@@ -108,14 +177,32 @@ async def handle_admin_broadcast(request: web.Request):
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after)
             try:
-                await bot.send_message(chat_id=tg_id, text=text, parse_mode="HTML")
+                await bot.send_message(chat_id=tg_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
                 sent += 1
             except Exception:
                 pass
         except Exception as e:
             logging.warning(f"Admin broadcast err for {tg_id}: {e}")
 
-    return web.json_response({"status": "done", "sent": sent, "blocked": blocked})
+    if not preview_self and target != "self":
+        try:
+            await run_db(
+                lambda: supabase.table("broadcast_logs")
+                .insert(
+                    {
+                        "admin_tg_id": request["tg_id"],
+                        "target_filter": target,
+                        "message_text": text[:500],
+                        "sent_count": sent,
+                        "blocked_count": blocked,
+                    }
+                )
+                .execute()
+            )
+        except Exception:
+            pass
+
+    return web.json_response({"status": "done", "sent": sent, "blocked": blocked, "preview": preview_self})
 
 
 async def handle_admin_refresh_rates(request: web.Request):

@@ -164,8 +164,19 @@ class PriceAlertCreate(BaseModel):
 
 class UserSettingsUpdate(BaseModel):
     default_account_id: Optional[str] = None
+    base_currency: Optional[str] = None
     weekly_digest: Optional[bool] = None
+    monthly_digest: Optional[bool] = None
+    budget_alerts_enabled: Optional[bool] = None
+    daily_reminder: Optional[bool] = None
     notifications_enabled: Optional[bool] = None
+
+    @field_validator("base_currency")
+    @classmethod
+    def check_base_currency(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        return _clean_currency(v)
 
 
 class CsvImportItem(BaseModel):
