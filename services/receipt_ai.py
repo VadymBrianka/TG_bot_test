@@ -8,7 +8,7 @@ import aiohttp
 from config import GEMINI_API_KEY
 from db import supabase, run_db
 
-MODELS_FALLBACK = ["gemini-3.8-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+MODELS_FALLBACK = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.8-flash"]
 
 
 PROMPT = """Ти — фінансовий асистент. Проаналізуй фото касового чеку (або квитанції) та поверни ТІЛЬКИ JSON-об'єкт з такими полями:
