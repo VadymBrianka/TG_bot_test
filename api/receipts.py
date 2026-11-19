@@ -27,5 +27,5 @@ async def handle_parse_receipt(request: web.Request):
     except ValueError as ve:
         return web.json_response({"error": str(ve)}, status=400)
     except Exception as e:
-        logging.error(f"Receipt parse error: {e}")
-        return web.json_response({"error": str(e)}, status=502)
+        logging.error(f"Receipt parse error: {e!r}")
+        return web.json_response({"error": str(e) or "Помилка розпізнавання чеку"}, status=502)

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import logging
@@ -6,6 +7,8 @@ import aiohttp
 
 from config import GEMINI_API_KEY
 from db import supabase, run_db
+
+MODELS_FALLBACK = ["gemini-3.8-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 
 
 PROMPT = """Ти — фінансовий асистент. Проаналізуй фото касового чеку (або квитанції) та поверни ТІЛЬКИ JSON-об'єкт з такими полями:
@@ -29,7 +32,6 @@ async def parse_receipt_image(image_b64: str, mime_type: str = "image/jpeg") -> 
         if ";" in header and ":" in header:
             mime_type = header.split(":", 1)[1].split(";", 1)[0] or mime_type
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [
             {
@@ -45,13 +47,37 @@ async def parse_receipt_image(image_b64: str, mime_type: str = "image/jpeg") -> 
         },
     }
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
-        async with session.post(url, json=payload) as resp:
-            body_text = await resp.text()
-            if resp.status != 200:
-                logging.error(f"Gemini Vision API error {resp.status}: {body_text[:400]}")
-                raise RuntimeError("Помилка звернення до ШІ-сервісу розпізнавання")
-            data = json.loads(body_text)
+    data = None
+    last_err = "ШІ-сервіс тимчасово недоступний, спробуйте за хвилину."
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        for model_name in MODELS_FALLBACK:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+            for attempt in range(2):
+                try:
+                    async with session.post(url, json=payload) as resp:
+                        body_text = await resp.text()
+                        if resp.status == 200:
+                            data = json.loads(body_text)
+                            break
+                        logging.warning(f"Gemini {model_name} HTTP {resp.status}: {body_text[:250]}")
+                        if resp.status in (503, 429) and attempt == 0:
+                            await asyncio.sleep(1.5)
+                            continue
+                        if resp.status in (404, 503, 429):
+                            last_err = f"ШІ-модель тимчасово перевантажена (HTTP {resp.status}), спробуйте ще раз."
+                            break
+                        raise RuntimeError(f"Помилка ШІ-сервісу (HTTP {resp.status})")
+                except asyncio.TimeoutError:
+                    logging.warning(f"Gemini {model_name} timeout (attempt {attempt + 1})")
+                    last_err = "ШІ-сервіс не відповів вчасно (таймаут). Спробуйте ще раз."
+                    if attempt == 0:
+                        continue
+                    break
+            if data is not None:
+                break
+
+    if data is None:
+        raise RuntimeError(last_err)
 
     try:
         text_out = data["candidates"][0]["content"]["parts"][0]["text"]
