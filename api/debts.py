@@ -1,6 +1,7 @@
 from aiohttp import web
 from db import supabase, run_db, get_exchange_rates, create_transaction_atomic
 from schemas import DebtCreate, parse_json_body
+from services.subscriptions import require_plan
 
 
 async def handle_list_debts(request: web.Request):
@@ -22,6 +23,9 @@ async def handle_list_debts(request: web.Request):
 
 
 async def handle_create_debt(request: web.Request):
+    denied = await require_plan(request, "pro")
+    if denied:
+        return denied
     body, err_resp = await parse_json_body(request, DebtCreate)
     if err_resp:
         return err_resp

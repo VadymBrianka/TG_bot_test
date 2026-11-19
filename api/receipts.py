@@ -1,9 +1,13 @@
 import logging
 from aiohttp import web
 from services.receipt_ai import parse_receipt_image, match_category_id
+from services.subscriptions import require_plan
 
 
 async def handle_parse_receipt(request: web.Request):
+    denied = await require_plan(request, "pro")
+    if denied:
+        return denied
     try:
         body = await request.json()
     except Exception:

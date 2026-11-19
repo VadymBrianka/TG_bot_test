@@ -9,6 +9,7 @@ from config import MINIAPP_URL, GEMINI_API_KEY
 from db import supabase, run_db, is_admin
 from services.nbu import update_rates_from_nbu
 from services.broadcast_ai import generate_broadcast_draft
+from services.subscriptions import activate_subscription, get_crypto_wallets, save_crypto_wallets
 
 
 async def _require_admin(request: web.Request) -> web.Response | None:
@@ -60,6 +61,20 @@ async def handle_admin_overview(request: web.Request):
         except Exception:
             b_logs = []
 
+        try:
+            pending_payments = (
+                supabase.table("subscription_payments")
+                .select("*")
+                .eq("status", "pending")
+                .order("created_at", desc=True)
+                .limit(20)
+                .execute()
+                .data
+                or []
+            )
+        except Exception:
+            pending_payments = []
+
         return {
             "stats": {
                 "users_count": users.count if users.count is not None else len(users.data or []),
@@ -83,13 +98,17 @@ async def handle_admin_overview(request: web.Request):
                     "role": u.get("role", "user"),
                     "is_banned": bool(u.get("is_banned", False)),
                     "base_currency": u.get("base_currency", "UAH"),
+                    "subscription_plan": u.get("subscription_plan", "free"),
+                    "subscription_expires_at": u.get("subscription_expires_at"),
                 }
                 for u in (users.data or [])
             ],
             "broadcast_logs": b_logs,
+            "pending_payments": pending_payments,
         }
 
     data = await run_db(_load)
+    data["wallets"] = await get_crypto_wallets()
     return web.json_response(data)
 
 
@@ -291,3 +310,108 @@ async def handle_admin_generate_broadcast(request: web.Request):
         return web.json_response({"error": str(ve)}, status=400)
     except Exception as e:
         return web.json_response({"error": str(e) or "Не вдалося згенерувати текст"}, status=502)
+
+
+async def handle_admin_set_subscription(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+
+    target_user_id = request.match_info.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    plan = str(body.get("plan", "free")).lower()
+    period = str(body.get("period", "month")).lower()
+    if plan not in ("free", "pro", "vip"):
+        return web.json_response({"error": "Тариф має бути free, pro або vip"}, status=400)
+
+    try:
+        if plan == "free":
+            await run_db(
+                lambda: supabase.table("users")
+                .update({"subscription_plan": "free", "subscription_expires_at": None})
+                .eq("id", target_user_id)
+                .execute()
+            )
+            return web.json_response({"status": "updated", "plan": "free"})
+        new_exp = await activate_subscription(target_user_id, plan, period)
+        return web.json_response({"status": "updated", "plan": plan, "expires_at": new_exp})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
+
+
+async def handle_admin_review_payment(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+
+    pay_id = request.match_info.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    decision = str(body.get("decision", "")).lower()  # approve | reject
+    if decision not in ("approve", "reject"):
+        return web.json_response({"error": "decision має бути approve або reject"}, status=400)
+
+    rows = await run_db(
+        lambda: supabase.table("subscription_payments").select("*").eq("id", pay_id).limit(1).execute().data
+    )
+    if not rows:
+        return web.json_response({"error": "Заявку не знайдено"}, status=404)
+    pay = rows[0]
+
+    bot = request.app.get("bot")
+    if decision == "approve":
+        new_exp = await activate_subscription(pay["user_id"], pay["plan"], pay["period"])
+        await run_db(
+            lambda: supabase.table("subscription_payments").update({"status": "approved"}).eq("id", pay_id).execute()
+        )
+        if bot and pay.get("telegram_id"):
+            try:
+                await bot.send_message(
+                    pay["telegram_id"],
+                    f"🎉 <b>Вашу крипто-оплату підтверджено!</b>\nАктивовано тариф <b>{pay['plan'].upper()}</b> до <b>{new_exp[:10]}</b>.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        return web.json_response({"status": "approved", "expires_at": new_exp})
+    else:
+        await run_db(
+            lambda: supabase.table("subscription_payments").update({"status": "rejected"}).eq("id", pay_id).execute()
+        )
+        if bot and pay.get("telegram_id"):
+            try:
+                await bot.send_message(
+                    pay["telegram_id"],
+                    "❌ Вашу заявку на крипто-оплату підписки відхилено. Зверніться до адміністратора.",
+                )
+            except Exception:
+                pass
+        return web.json_response({"status": "rejected"})
+
+
+async def handle_admin_save_wallets(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    wallets = body.get("wallets") or {}
+    if not isinstance(wallets, dict):
+        return web.json_response({"error": "wallets має бути об'єктом"}, status=400)
+
+    try:
+        await save_crypto_wallets(wallets)
+        return web.json_response({"status": "saved"})
+    except Exception as e:
+        return web.json_response({"error": f"Не вдалося зберегти гаманці (перевірте migrations.sql): {e}"}, status=400)

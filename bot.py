@@ -57,11 +57,15 @@ from api.admin import (
     handle_admin_generate_broadcast,
     handle_admin_refresh_rates,
     handle_admin_send_dm,
+    handle_admin_set_subscription,
+    handle_admin_review_payment,
+    handle_admin_save_wallets,
 )
 from api.receipts import handle_parse_receipt
 from api.debts import handle_list_debts, handle_create_debt, handle_settle_debt, handle_delete_debt
+from api.subscriptions import handle_get_plans, handle_create_stars_invoice, handle_create_crypto_request
 
-from bot_handlers import admin, commands, quick_entry, callbacks
+from bot_handlers import admin, commands, quick_entry, callbacks, subscriptions
 
 logging.basicConfig(level=logging.INFO)
 
@@ -70,6 +74,7 @@ dp = Dispatcher()
 dp.message.outer_middleware(BanCheckMiddleware())
 dp.callback_query.outer_middleware(BanCheckMiddleware())
 dp.include_router(admin.router)
+dp.include_router(subscriptions.router)
 dp.include_router(commands.router)
 dp.include_router(callbacks.router)
 dp.include_router(quick_entry.router)
@@ -148,11 +153,19 @@ def create_web_app() -> web.Application:
     app.router.add_post("/api/v1/debts/{id}/settle", handle_settle_debt)
     app.router.add_delete("/api/v1/debts/{id}", handle_delete_debt)
 
+    # Subscriptions
+    app.router.add_get("/api/v1/subscriptions/plans", handle_get_plans)
+    app.router.add_post("/api/v1/subscriptions/stars-invoice", handle_create_stars_invoice)
+    app.router.add_post("/api/v1/subscriptions/crypto-request", handle_create_crypto_request)
+
     # Admin
     app.router.add_get("/api/v1/admin/overview", handle_admin_overview)
     app.router.add_put("/api/v1/admin/users/{id}/role", handle_admin_set_role)
     app.router.add_put("/api/v1/admin/users/{id}/ban", handle_admin_ban_user)
+    app.router.add_put("/api/v1/admin/users/{id}/subscription", handle_admin_set_subscription)
     app.router.add_post("/api/v1/admin/users/{id}/dm", handle_admin_send_dm)
+    app.router.add_post("/api/v1/admin/payments/{id}/review", handle_admin_review_payment)
+    app.router.add_put("/api/v1/admin/wallets", handle_admin_save_wallets)
     app.router.add_post("/api/v1/admin/broadcast", handle_admin_broadcast)
     app.router.add_post("/api/v1/admin/broadcast/generate", handle_admin_generate_broadcast)
     app.router.add_post("/api/v1/admin/refresh-rates", handle_admin_refresh_rates)

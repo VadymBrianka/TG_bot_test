@@ -1,0 +1,143 @@
+import logging
+from aiohttp import web
+from aiogram.types import LabeledPrice, InlineKeyboardMarkup, InlineKeyboardButton
+
+from config import ADMIN_ID
+from db import supabase, run_db
+from services.subscriptions import PLANS, get_user_subscription, get_crypto_wallets
+
+
+async def handle_get_plans(request: web.Request):
+    user_uuid: str = request["user_uuid"]
+    tg_id: int = request["tg_id"]
+    sub = await get_user_subscription(tg_id)
+    wallets = await get_crypto_wallets()
+
+    try:
+        payments = await run_db(
+            lambda: supabase.table("subscription_payments")
+            .select("*")
+            .eq("user_id", user_uuid)
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        payments = []
+
+    return web.json_response(
+        {
+            "plans": PLANS,
+            "subscription": sub,
+            "wallets": wallets,
+            "payments": payments,
+        }
+    )
+
+
+async def handle_create_stars_invoice(request: web.Request):
+    user_uuid: str = request["user_uuid"]
+    bot = request.app.get("bot")
+    if not bot:
+        return web.json_response({"error": "Bot unavailable"}, status=500)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    plan = str(body.get("plan", "")).lower()
+    period = str(body.get("period", "month")).lower()
+    if plan not in ("pro", "vip") or period not in ("month", "year"):
+        return web.json_response({"error": "Некоректний тариф або період"}, status=400)
+
+    stars_amount = PLANS[plan][f"stars_{period}"]
+    period_label = "1 рік (-33%)" if period == "year" else "1 місяць"
+    title = f"FinTrack Hub {PLANS[plan]['name']} ({period_label})"
+    description = ", ".join(PLANS[plan]["features"][:3])
+    payload = f"sub:{user_uuid}:{plan}:{period}"
+
+    try:
+        invoice_url = await bot.create_invoice_link(
+            title=title,
+            description=description,
+            payload=payload,
+            currency="XTR",
+            prices=[LabeledPrice(label=title, amount=int(stars_amount))],
+        )
+        return web.json_response({"invoice_url": invoice_url, "stars": stars_amount})
+    except Exception as e:
+        logging.error(f"Stars invoice error: {e}")
+        return web.json_response({"error": f"Не вдалося створити рахунок Telegram Stars: {e}"}, status=502)
+
+
+async def handle_create_crypto_request(request: web.Request):
+    user_uuid: str = request["user_uuid"]
+    tg_id: int = request["tg_id"]
+    bot = request.app.get("bot")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    plan = str(body.get("plan", "")).lower()
+    period = str(body.get("period", "month")).lower()
+    currency = str(body.get("currency", "USDT")).strip().upper()
+    tx_hash = str(body.get("tx_hash", "")).strip()
+
+    if plan not in ("pro", "vip") or period not in ("month", "year"):
+        return web.json_response({"error": "Некоректний тариф або період"}, status=400)
+    if not tx_hash:
+        return web.json_response({"error": "Вкажіть TX Hash або деталі переказу"}, status=400)
+
+    amount = float(PLANS[plan][f"usd_{period}"])
+
+    try:
+        res = await run_db(
+            lambda: supabase.table("subscription_payments")
+            .insert(
+                {
+                    "user_id": user_uuid,
+                    "telegram_id": tg_id,
+                    "plan": plan,
+                    "period": period,
+                    "payment_method": "crypto",
+                    "currency": currency,
+                    "amount": amount,
+                    "tx_hash": tx_hash[:250],
+                    "status": "pending",
+                }
+            )
+            .execute()
+        )
+        pay_row = res.data[0]
+    except Exception as e:
+        return web.json_response({"error": f"Помилка збереження заявки (перевірте migrations.sql): {e}"}, status=400)
+
+    if bot:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Підтвердити", callback_data=f"sub_ok:{pay_row['id']}"),
+                    InlineKeyboardButton(text="❌ Відхилити", callback_data=f"sub_rej:{pay_row['id']}"),
+                ]
+            ]
+        )
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🪙 <b>Нова крипто-оплата підписки!</b>\n\n"
+                f"👤 Користувач: <code>{tg_id}</code>\n"
+                f"💎 Тариф: <b>{plan.upper()} ({period})</b>\n"
+                f"💵 Сума: <b>{amount} {currency}</b>\n"
+                f"🔗 TX / Коментар: <code>{tx_hash}</code>",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    return web.json_response({"status": "pending", "payment": pay_row})

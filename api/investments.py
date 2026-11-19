@@ -3,9 +3,13 @@ from aiohttp import web
 from db import supabase, run_db, get_exchange_rates, create_transaction_atomic
 from schemas import InvestmentCreate, InvestmentUpdate, parse_json_body
 from services.market_quotes import fetch_prices_parallel
+from services.subscriptions import require_plan
 
 
 async def handle_create_investment(request: web.Request):
+    denied = await require_plan(request, "vip")
+    if denied:
+        return denied
     body, err_resp = await parse_json_body(request, InvestmentCreate)
     if err_resp:
         return err_resp
@@ -171,6 +175,9 @@ async def handle_delete_investment(request: web.Request):
 
 
 async def handle_refresh_investment_prices(request: web.Request):
+    denied = await require_plan(request, "vip")
+    if denied:
+        return denied
     user_uuid: str = request["user_uuid"]
     try:
         invs = await run_db(

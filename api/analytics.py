@@ -3,9 +3,13 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from aiohttp import web
 from db import supabase, run_db, get_exchange_rates
+from services.subscriptions import require_plan
 
 
 async def handle_analytics_and_forecast(request: web.Request):
+    denied = await require_plan(request, "pro")
+    if denied:
+        return denied
     try:
         user_uuid: str = request["user_uuid"]
         date_from_str = request.query.get("date_from", "").strip()

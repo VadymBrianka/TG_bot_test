@@ -3,6 +3,7 @@ from aiohttp import web
 from aiogram.types import BufferedInputFile
 from db import supabase, run_db, get_exchange_rates, create_transaction_atomic
 from services.export_csv import build_transactions_csv
+from services.subscriptions import require_plan
 from schemas import (
     BudgetCreate,
     RecurringCreate,
@@ -68,6 +69,9 @@ async def handle_list_budgets(request: web.Request):
 
 
 async def handle_create_budget(request: web.Request):
+    denied = await require_plan(request, "pro")
+    if denied:
+        return denied
     body, err_resp = await parse_json_body(request, BudgetCreate)
     if err_resp:
         return err_resp
@@ -142,6 +146,9 @@ async def handle_list_recurring(request: web.Request):
 
 
 async def handle_create_recurring(request: web.Request):
+    denied = await require_plan(request, "pro")
+    if denied:
+        return denied
     body, err_resp = await parse_json_body(request, RecurringCreate)
     if err_resp:
         return err_resp
@@ -204,6 +211,9 @@ async def handle_list_alerts(request: web.Request):
 
 
 async def handle_create_alert(request: web.Request):
+    denied = await require_plan(request, "vip")
+    if denied:
+        return denied
     body, err_resp = await parse_json_body(request, PriceAlertCreate)
     if err_resp:
         return err_resp
@@ -292,6 +302,9 @@ async def handle_export_csv(request: web.Request):
 
 
 async def handle_export_send_telegram(request: web.Request):
+    denied = await require_plan(request, "pro")
+    if denied:
+        return denied
     user_uuid: str = request["user_uuid"]
     tg_id: int = request["tg_id"]
     bot = request.app.get("bot")
@@ -312,6 +325,9 @@ async def handle_export_send_telegram(request: web.Request):
 
 
 async def handle_import_csv(request: web.Request):
+    denied = await require_plan(request, "pro")
+    if denied:
+        return denied
     body, err_resp = await parse_json_body(request, CsvImportRequest)
     if err_resp:
         return err_resp

@@ -12,7 +12,31 @@ ALTER TABLE users
   ADD COLUMN IF NOT EXISTS daily_reminder BOOLEAN DEFAULT FALSE,
   ADD COLUMN IF NOT EXISTS notifications_enabled BOOLEAN DEFAULT TRUE,
   ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user',
-  ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE;
+  ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS subscription_plan TEXT NOT NULL DEFAULT 'free',
+  ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ;
+
+-- Subscription payments & crypto payment requests
+CREATE TABLE IF NOT EXISTS subscription_payments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  telegram_id BIGINT NOT NULL,
+  plan TEXT NOT NULL CHECK (plan IN ('pro', 'vip')),
+  period TEXT NOT NULL CHECK (period IN ('month', 'year')),
+  payment_method TEXT NOT NULL CHECK (payment_method IN ('stars', 'crypto')),
+  currency TEXT NOT NULL,
+  amount NUMERIC(18, 6) NOT NULL,
+  tx_hash TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'paid')),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Global app settings (e.g. crypto wallet addresses)
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 
 -- Broadcast history table for admin panel
 CREATE TABLE IF NOT EXISTS broadcast_logs (

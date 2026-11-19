@@ -13,6 +13,7 @@ from db import (
 )
 from services.budget_alerts import check_budget_threshold
 from services.receipt_ai import parse_receipt_bytes, match_category_id
+from services.subscriptions import get_user_subscription, has_plan
 
 router = Router()
 
@@ -203,6 +204,14 @@ async def handle_quick_expense(message: Message):
 @router.message(F.photo)
 async def handle_receipt_photo(message: Message):
     if not message.from_user or not message.photo:
+        return
+    sub = await get_user_subscription(message.from_user.id)
+    if not has_plan(sub["plan"], "pro"):
+        await message.reply(
+            "🔒 <b>ШІ-сканування чеків доступне на тарифі Pro або VIP.</b>\n"
+            "Натисніть /subscribe або відкрийте вкладку <b>💎 Підписка</b> у Mini App.",
+            parse_mode="HTML",
+        )
         return
     user_uuid = await get_user_uuid_by_tg_id(message.from_user.id)
     if not user_uuid:

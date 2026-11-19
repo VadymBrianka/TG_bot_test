@@ -26,6 +26,7 @@ USER_COMMANDS = [
     BotCommand(command="alert", description="Створити алерт: /alert BTC > 100000"),
     BotCommand(command="recurring", description="Регулярні платежі"),
     BotCommand(command="export", description="Отримати CSV-виписку в чат"),
+    BotCommand(command="subscribe", description="💎 Підписка Pro / VIP"),
     BotCommand(command="help", description="Довідка по командах і швидкому запису"),
 ]
 
