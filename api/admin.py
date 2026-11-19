@@ -174,7 +174,7 @@ async def handle_admin_broadcast(request: web.Request):
         )
     elif attach_miniapp_btn and MINIAPP_URL:
         reply_markup = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="📊 Відкрити FinTrack Hub", web_app=WebAppInfo(url=MINIAPP_URL))]]
+            inline_keyboard=[[InlineKeyboardButton(text="💎 Відкрити FinTrack Hub", web_app=WebAppInfo(url=MINIAPP_URL))]]
         )
 
     if preview_self or target == "self":

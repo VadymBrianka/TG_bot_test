@@ -39,9 +39,17 @@ class TransactionUpdate(BaseModel):
     category_id: Optional[str] = None
     amount: float = Field(..., gt=0)
     target_amount: Optional[float] = Field(default=None, gt=0)
+    currency: Optional[str] = None
     type: Literal["expense", "income", "transfer"]
     note: str = Field(default="", max_length=500)
     transaction_date: Optional[str] = None
+
+    @field_validator("currency")
+    @classmethod
+    def check_upd_currency(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or not v.strip():
+            return None
+        return _clean_currency(v)
 
 
 class AccountCreate(BaseModel):

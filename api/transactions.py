@@ -137,6 +137,7 @@ async def handle_update_transaction(request: web.Request):
 
     user_uuid: str = request["user_uuid"]
     category_id = body.category_id if body.category_id and not body.category_id.startswith("other_") else None
+    rates = await get_exchange_rates()
 
     try:
         def _update():
@@ -155,10 +156,12 @@ async def handle_update_transaction(request: web.Request):
 
             # Verify new account ownership if changed
             new_acc_id = body.account_id or old_tx.get("account_id")
+            acc_curr = "UAH"
             if new_acc_id:
-                acc_ok = supabase.table("accounts").select("id").eq("id", new_acc_id).eq("user_id", user_uuid).execute().data
+                acc_ok = supabase.table("accounts").select("id, currency").eq("id", new_acc_id).eq("user_id", user_uuid).execute().data
                 if not acc_ok:
                     raise ValueError("Рахунок не знайдено")
+                acc_curr = str(acc_ok[0].get("currency") or "UAH").upper()
 
             new_to_acc_id = body.to_account_id if body.type == "transfer" else None
             if body.type == "transfer":
@@ -168,6 +171,20 @@ async def handle_update_transaction(request: web.Request):
                 if not to_ok:
                     raise ValueError("Рахунок отримувача не знайдено")
 
+            final_amount = body.amount
+            final_note = body.note
+            if body.currency and body.type in ("expense", "income"):
+                tx_curr = body.currency.upper()
+                if tx_curr != acc_curr:
+                    r_tx = rates.get(tx_curr, 1.0)
+                    r_acc = rates.get(acc_curr, 1.0)
+                    final_amount = round(body.amount * (r_tx / r_acc), 4)
+                    if final_amount >= 0.01:
+                        final_amount = round(final_amount, 2)
+                    suffix = f"({body.amount:g} {tx_curr})"
+                    if suffix not in final_note:
+                        final_note = f"{final_note} {suffix}".strip() if final_note else suffix
+
             # 1. Reverse old balance effect
             apply_tx_balance_effect_sync(old_tx, user_uuid, reverse=True)
 
@@ -176,10 +193,10 @@ async def handle_update_transaction(request: web.Request):
                 "account_id": new_acc_id,
                 "to_account_id": new_to_acc_id,
                 "category_id": category_id if body.type != "transfer" else None,
-                "amount": body.amount,
-                "target_amount": (body.target_amount or body.amount) if body.type == "transfer" else None,
+                "amount": final_amount,
+                "target_amount": (body.target_amount or final_amount) if body.type == "transfer" else None,
                 "type": body.type,
-                "note": body.note,
+                "note": final_note,
             }
             if body.transaction_date:
                 update_payload["transaction_date"] = body.transaction_date

@@ -72,7 +72,7 @@ async def cmd_start(message: Message):
     try:
         await message.bot.set_chat_menu_button(
             chat_id=chat_id,
-            menu_button=MenuButtonWebApp(text="📊 Капітал", web_app=WebAppInfo(url=MINIAPP_URL)),
+            menu_button=MenuButtonWebApp(text="💎 Капітал", web_app=WebAppInfo(url=MINIAPP_URL)),
         )
         if await is_admin(user.id):
             await message.bot.set_my_commands(

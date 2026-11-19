@@ -8,10 +8,19 @@ from db import supabase, run_db, get_exchange_rates
 async def handle_analytics_and_forecast(request: web.Request):
     try:
         user_uuid: str = request["user_uuid"]
-        days_back = min(max(int(request.query.get("days", 30)), 1), 365)
+        date_from_str = request.query.get("date_from", "").strip()
+        date_to_str = request.query.get("date_to", "").strip()
 
         now = datetime.now(timezone.utc)
-        start_dt = now - timedelta(days=days_back)
+        if date_from_str and date_to_str:
+            start_dt = datetime.fromisoformat(f"{date_from_str}T00:00:00+00:00")
+            end_dt = datetime.fromisoformat(f"{date_to_str}T23:59:59+00:00")
+            days_back = max((end_dt.date() - start_dt.date()).days + 1, 1)
+        else:
+            days_back = min(max(int(request.query.get("days", 30)), 1), 365)
+            end_dt = now
+            start_dt = now - timedelta(days=days_back)
+
         prev_start_dt = start_dt - timedelta(days=days_back)
 
         def _load():
@@ -20,6 +29,7 @@ async def handle_analytics_and_forecast(request: web.Request):
                 .select("amount, target_amount, type, note, transaction_date, category_id, account_id, to_account_id")
                 .eq("user_id", user_uuid)
                 .gte("transaction_date", prev_start_dt.isoformat())
+                .lte("transaction_date", end_dt.isoformat())
                 .execute()
                 .data
                 or []
@@ -35,7 +45,8 @@ async def handle_analytics_and_forecast(request: web.Request):
         acc_curr_map = {a["id"]: str(a.get("currency", "UAH")).upper() for a in all_accounts}
 
         start_iso = start_dt.isoformat()
-        cur_txs = [t for t in all_txs if (t.get("transaction_date") or "") >= start_iso]
+        end_iso = end_dt.isoformat()
+        cur_txs = [t for t in all_txs if start_iso <= (t.get("transaction_date") or "") <= end_iso]
         prev_txs = [t for t in all_txs if (t.get("transaction_date") or "") < start_iso]
 
         def _to_uah(tx: dict) -> float:
