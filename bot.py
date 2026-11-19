@@ -6,6 +6,7 @@ from aiogram.types import BotCommandScopeChat
 
 from config import BOT_TOKEN, SERVER_PORT, ADMIN_ID
 from middlewares.auth import cors_middleware, auth_middleware
+from middlewares.bot_ban import BanCheckMiddleware
 from services.scheduler import start_scheduler
 from bot_handlers.commands import USER_COMMANDS, ADMIN_EXTRA_COMMANDS
 
@@ -53,6 +54,7 @@ from api.admin import (
     handle_admin_set_role,
     handle_admin_ban_user,
     handle_admin_broadcast,
+    handle_admin_generate_broadcast,
     handle_admin_refresh_rates,
     handle_admin_send_dm,
 )
@@ -65,6 +67,8 @@ logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+dp.message.outer_middleware(BanCheckMiddleware())
+dp.callback_query.outer_middleware(BanCheckMiddleware())
 dp.include_router(admin.router)
 dp.include_router(commands.router)
 dp.include_router(callbacks.router)
@@ -150,6 +154,7 @@ def create_web_app() -> web.Application:
     app.router.add_put("/api/v1/admin/users/{id}/ban", handle_admin_ban_user)
     app.router.add_post("/api/v1/admin/users/{id}/dm", handle_admin_send_dm)
     app.router.add_post("/api/v1/admin/broadcast", handle_admin_broadcast)
+    app.router.add_post("/api/v1/admin/broadcast/generate", handle_admin_generate_broadcast)
     app.router.add_post("/api/v1/admin/refresh-rates", handle_admin_refresh_rates)
 
     return app

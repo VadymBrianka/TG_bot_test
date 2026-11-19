@@ -8,6 +8,7 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from config import MINIAPP_URL, GEMINI_API_KEY
 from db import supabase, run_db, is_admin
 from services.nbu import update_rates_from_nbu
+from services.broadcast_ai import generate_broadcast_draft
 
 
 async def _require_admin(request: web.Request) -> web.Response | None:
@@ -266,3 +267,27 @@ async def handle_admin_send_dm(request: web.Request):
         return web.json_response({"status": "sent"})
     except Exception as e:
         return web.json_response({"error": f"Не вдалося надіслати: {e}"}, status=502)
+
+
+async def handle_admin_generate_broadcast(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    topic = str(body.get("topic", "")).strip()
+    tone = str(body.get("tone", "дружній")).strip()
+    if not topic:
+        return web.json_response({"error": "Вкажіть тему або ідею для статті"}, status=400)
+
+    try:
+        draft = await generate_broadcast_draft(topic=topic, tone=tone)
+        return web.json_response(draft)
+    except ValueError as ve:
+        return web.json_response({"error": str(ve)}, status=400)
+    except Exception as e:
+        return web.json_response({"error": str(e) or "Не вдалося згенерувати текст"}, status=502)
