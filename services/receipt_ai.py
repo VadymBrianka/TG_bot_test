@@ -29,7 +29,7 @@ async def parse_receipt_image(image_b64: str, mime_type: str = "image/jpeg") -> 
         if ";" in header and ":" in header:
             mime_type = header.split(":", 1)[1].split(";", 1)[0] or mime_type
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [
             {
