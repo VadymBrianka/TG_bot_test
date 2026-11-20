@@ -69,14 +69,10 @@ from api.debts import handle_list_debts, handle_create_debt, handle_settle_debt,
 from api.subscriptions import handle_get_plans, handle_create_stars_invoice, handle_create_crypto_request
 from api.trading import (
     handle_trading_overview,
+    handle_trading_save_bot,
+    handle_trading_step,
+    handle_trading_close_position,
     handle_trading_demo_reset,
-    handle_trading_transfer,
-    handle_trading_crypto_deposit,
-    handle_trading_save_binance_keys,
-    handle_trading_create_bot,
-    handle_trading_toggle_bot,
-    handle_trading_step_bot,
-    handle_trading_delete_bot,
 )
 
 from bot_handlers import admin, commands, quick_entry, callbacks, subscriptions
@@ -172,16 +168,12 @@ def create_web_app() -> web.Application:
     app.router.add_post("/api/v1/subscriptions/stars-invoice", handle_create_stars_invoice)
     app.router.add_post("/api/v1/subscriptions/crypto-request", handle_create_crypto_request)
 
-    # VIP Trading Bot
+    # VIP Demo Trading Bot
     app.router.add_get("/api/v1/trading/overview", handle_trading_overview)
+    app.router.add_post("/api/v1/trading/bot/save", handle_trading_save_bot)
+    app.router.add_post("/api/v1/trading/bot/step", handle_trading_step)
+    app.router.add_post("/api/v1/trading/positions/{id}/close", handle_trading_close_position)
     app.router.add_post("/api/v1/trading/demo/reset", handle_trading_demo_reset)
-    app.router.add_post("/api/v1/trading/transfer", handle_trading_transfer)
-    app.router.add_post("/api/v1/trading/crypto-deposit", handle_trading_crypto_deposit)
-    app.router.add_put("/api/v1/trading/binance-keys", handle_trading_save_binance_keys)
-    app.router.add_post("/api/v1/trading/bots", handle_trading_create_bot)
-    app.router.add_post("/api/v1/trading/bots/{id}/toggle", handle_trading_toggle_bot)
-    app.router.add_post("/api/v1/trading/bots/{id}/step", handle_trading_step_bot)
-    app.router.add_delete("/api/v1/trading/bots/{id}", handle_trading_delete_bot)
 
     # Admin
     app.router.add_get("/api/v1/admin/overview", handle_admin_overview)

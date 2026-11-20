@@ -52,48 +52,40 @@ CREATE TABLE IF NOT EXISTS giveaways (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- VIP Crypto Trading Bot: user trading balances (Demo + Real) & optional Binance API keys
+-- VIP Demo Crypto Trading Bot: demo balance, autonomous bot config, and full positions history
 CREATE TABLE IF NOT EXISTS trading_wallets (
   user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   demo_usdt NUMERIC(18, 4) NOT NULL DEFAULT 10000.0,
-  real_usdt NUMERIC(18, 4) NOT NULL DEFAULT 0.0,
-  binance_api_key TEXT DEFAULT '',
-  binance_api_secret TEXT DEFAULT '',
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- VIP Crypto Trading Bot configurations
 CREATE TABLE IF NOT EXISTS trading_bots (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  mode TEXT NOT NULL DEFAULT 'demo' CHECK (mode IN ('demo', 'real')),
-  symbol TEXT NOT NULL DEFAULT 'BTCUSDT',
-  strategy TEXT NOT NULL DEFAULT 'tp_sl' CHECK (strategy IN ('tp_sl', 'dca', 'momentum')),
-  order_usdt NUMERIC(14, 2) NOT NULL CHECK (order_usdt > 0),
-  take_profit_pct NUMERIC(6, 2) NOT NULL DEFAULT 3.0,
-  stop_loss_pct NUMERIC(6, 2) NOT NULL DEFAULT 2.0,
+  user_id UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  auto_select BOOLEAN NOT NULL DEFAULT TRUE,
+  symbols JSONB NOT NULL DEFAULT '[]'::jsonb,
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  position_qty NUMERIC(18, 8) NOT NULL DEFAULT 0,
-  entry_price NUMERIC(18, 4) NOT NULL DEFAULT 0,
-  realized_pnl NUMERIC(18, 4) NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- VIP Crypto Trading Bot executed orders history
-CREATE TABLE IF NOT EXISTS trading_orders (
+CREATE TABLE IF NOT EXISTS trading_positions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  bot_id UUID REFERENCES trading_bots(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  mode TEXT NOT NULL DEFAULT 'demo',
   symbol TEXT NOT NULL,
-  side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
-  price NUMERIC(18, 4) NOT NULL,
+  strategy TEXT NOT NULL DEFAULT 'AI-Momentum',
+  usdt_invested NUMERIC(18, 4) NOT NULL,
   quantity NUMERIC(18, 8) NOT NULL,
-  usdt_amount NUMERIC(18, 4) NOT NULL,
-  pnl NUMERIC(18, 4) DEFAULT 0,
-  reason TEXT DEFAULT '',
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  entry_price NUMERIC(18, 4) NOT NULL,
+  exit_price NUMERIC(18, 4),
+  pnl_usdt NUMERIC(18, 4) DEFAULT 0,
+  pnl_pct NUMERIC(8, 2) DEFAULT 0,
+  tp_pct NUMERIC(6, 2) NOT NULL DEFAULT 2.8,
+  sl_pct NUMERIC(6, 2) NOT NULL DEFAULT 1.8,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+  close_reason TEXT DEFAULT '',
+  opened_at TIMESTAMPTZ DEFAULT NOW(),
+  closed_at TIMESTAMPTZ
 );
 
 -- Broadcast history table for admin panel

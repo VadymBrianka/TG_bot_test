@@ -1,25 +1,33 @@
 import asyncio
-import hashlib
-import hmac
 import logging
-import time
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlencode
 import aiohttp
 
 from db import supabase, run_db
 from services.market_quotes import get_realtime_price
 
+ALL_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "TONUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"]
 
-async def get_or_create_trading_wallet(user_uuid: str) -> dict[str, Any]:
+
+async def get_or_create_demo_wallet(user_uuid: str) -> dict[str, Any]:
     def _q():
         res = supabase.table("trading_wallets").select("*").eq("user_id", user_uuid).limit(1).execute().data
         if res:
             return res[0]
+        ins = supabase.table("trading_wallets").insert({"user_id": user_uuid, "demo_usdt": 10000.0}).execute().data
+        return ins[0]
+    return await run_db(_q)
+
+
+async def get_or_create_bot_config(user_uuid: str) -> dict[str, Any]:
+    def _q():
+        res = supabase.table("trading_bots").select("*").eq("user_id", user_uuid).limit(1).execute().data
+        if res:
+            return res[0]
         ins = (
-            supabase.table("trading_wallets")
-            .insert({"user_id": user_uuid, "demo_usdt": 10000.0, "real_usdt": 0.0})
+            supabase.table("trading_bots")
+            .insert({"user_id": user_uuid, "auto_select": True, "symbols": [], "is_active": False})
             .execute()
             .data
         )
@@ -27,242 +35,223 @@ async def get_or_create_trading_wallet(user_uuid: str) -> dict[str, Any]:
     return await run_db(_q)
 
 
-async def fetch_rsi_14(symbol: str) -> float | None:
+async def _analyze_pair_signal(session: aiohttp.ClientSession, symbol: str) -> dict[str, Any] | None:
+    """Analyze 15m Binance klines (RSI-14 + EMA7/EMA21) and score entry attractiveness."""
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval=15m&limit=20"
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return None
-                klines = await resp.json()
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=15m&limit=30"
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                return None
+            klines = await resp.json()
         closes = [float(k[4]) for k in klines]
-        if len(closes) < 15:
+        if len(closes) < 21:
             return None
-        gains = []
-        losses = []
-        for i in range(1, len(closes)):
-            diff = closes[i] - closes[i - 1]
-            gains.append(max(diff, 0.0))
-            losses.append(max(-diff, 0.0))
-        avg_gain = sum(gains[-14:]) / 14.0
-        avg_loss = sum(losses[-14:]) / 14.0
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return round(100.0 - (100.0 / (1.0 + rs)), 2)
+
+        price = closes[-1]
+        # RSI-14
+        diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+        gains = [max(d, 0.0) for d in diffs[-14:]]
+        losses = [max(-d, 0.0) for d in diffs[-14:]]
+        avg_g = sum(gains) / 14.0
+        avg_l = sum(losses) / 14.0
+        rsi = 100.0 if avg_l == 0 else round(100.0 - (100.0 / (1.0 + avg_g / avg_l)), 2)
+
+        ema7 = sum(closes[-7:]) / 7.0
+        ema21 = sum(closes[-21:]) / 21.0
+
+        # Higher score = better bullish / pullback entry
+        score = 0.0
+        strategy_tag = "Momentum"
+        if rsi < 38:
+            score += (45 - rsi) * 2.0
+            strategy_tag = f"Oversold RSI {rsi}"
+        elif ema7 > ema21 and rsi < 62:
+            score += 25.0 + (62 - rsi) * 0.5
+            strategy_tag = f"Uptrend EMA (RSI {rsi})"
+        elif rsi <= 65:
+            score += 10.0
+            strategy_tag = f"Balanced (RSI {rsi})"
+        else:
+            score -= 20.0  # overbought, avoid buying top
+
+        return {"symbol": symbol, "price": price, "rsi": rsi, "score": score, "strategy": strategy_tag}
     except Exception:
         return None
 
 
-async def execute_binance_spot_order(
-    api_key: str,
-    api_secret: str,
-    symbol: str,
-    side: str,
-    quote_usdt: float | None = None,
-    quantity: float | None = None,
-) -> tuple[bool, str]:
-    """Execute a live Binance Spot MARKET order when user has configured Binance API keys."""
-    if not api_key or not api_secret:
-        return False, "No Binance keys"
-    try:
-        params: dict[str, Any] = {
-            "symbol": symbol.upper(),
-            "side": side.upper(),
-            "type": "MARKET",
-            "timestamp": int(time.time() * 1000),
-        }
-        if side.upper() == "BUY" and quote_usdt:
-            params["quoteOrderQty"] = round(quote_usdt, 2)
-        elif quantity:
-            params["quantity"] = round(quantity, 6)
+async def close_position_at_price(
+    pos: dict[str, Any],
+    exit_price: float,
+    reason: str,
+    tg_bot=None,
+    user_tg_id: int | None = None,
+) -> dict[str, Any]:
+    user_uuid = pos["user_id"]
+    qty = float(pos["quantity"])
+    entry_price = float(pos["entry_price"])
+    invested = float(pos["usdt_invested"])
 
-        query = urlencode(params)
-        sig = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
-        url = f"https://api.binance.com/api/v3/order?{query}&signature={sig}"
-        headers = {"X-MBX-APIKEY": api_key}
+    proceeds = round(qty * exit_price, 4)
+    pnl_usdt = round(proceeds - invested, 4)
+    pnl_pct = round(((exit_price - entry_price) / entry_price) * 100.0, 2) if entry_price > 0 else 0.0
 
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
-            async with session.post(url, headers=headers) as resp:
-                data = await resp.json()
-                if resp.status == 200:
-                    return True, f"Binance Order #{data.get('orderId')}"
-                return False, data.get("msg", f"HTTP {resp.status}")
-    except Exception as e:
-        return False, str(e)
+    wallet = await get_or_create_demo_wallet(user_uuid)
+    new_bal = round(float(wallet.get("demo_usdt") or 0) + proceeds, 4)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    def _db():
+        supabase.table("trading_wallets").update({"demo_usdt": new_bal, "updated_at": now_iso}).eq("user_id", user_uuid).execute()
+        supabase.table("trading_positions").update(
+            {
+                "exit_price": round(exit_price, 4),
+                "pnl_usdt": pnl_usdt,
+                "pnl_pct": pnl_pct,
+                "status": "closed",
+                "close_reason": reason,
+                "closed_at": now_iso,
+            }
+        ).eq("id", pos["id"]).execute()
+
+    await run_db(_db)
+    if tg_bot and user_tg_id:
+        emoji = "🟢" if pnl_usdt >= 0 else "🔴"
+        try:
+            await tg_bot.send_message(
+                user_tg_id,
+                f"🤖 <b>[DEMO] Позицію {pos['symbol']} закрито</b>\n"
+                f"Вхід: <b>${entry_price:,.4f}</b> → Вихід: <b>${exit_price:,.4f}</b>\n"
+                f"{emoji} PnL: <b>{pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%)</b>\n"
+                f"📌 {reason}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    return {"symbol": pos["symbol"], "pnl_usdt": pnl_usdt, "pnl_pct": pnl_pct, "reason": reason}
 
 
-async def step_trading_bot(bot_row: dict[str, Any], tg_bot=None, user_tg_id: int | None = None) -> dict[str, Any]:
-    """Evaluate one trading bot tick against live market prices and execute BUY/SELL if triggered."""
-    user_uuid = bot_row["user_id"]
-    bot_id = bot_row["id"]
-    mode = bot_row.get("mode", "demo")
-    symbol = str(bot_row.get("symbol", "BTCUSDT")).upper()
-    ticker = symbol.replace("USDT", "")
-    strategy = bot_row.get("strategy", "tp_sl")
-    order_usdt = float(bot_row.get("order_usdt") or 50.0)
-    tp_pct = float(bot_row.get("take_profit_pct") or 3.0)
-    sl_pct = float(bot_row.get("stop_loss_pct") or 2.0)
+async def step_autonomous_bot(user_uuid: str, tg_bot=None, user_tg_id: int | None = None) -> dict[str, Any]:
+    """Run one autonomous trading cycle: manage open positions + open new profitable setups."""
+    wallet = await get_or_create_demo_wallet(user_uuid)
+    cfg = await get_or_create_bot_config(user_uuid)
+    demo_bal = float(wallet.get("demo_usdt") or 0.0)
 
-    pos_qty = float(bot_row.get("position_qty") or 0.0)
-    entry_price = float(bot_row.get("entry_price") or 0.0)
-    realized_pnl = float(bot_row.get("realized_pnl") or 0.0)
-
-    price = await get_realtime_price(ticker, "crypto", use_cache=False)
-    if not price or price <= 0:
-        return {"action": "hold", "reason": "Ціна тимчасово недоступна"}
-
-    wallet = await get_or_create_trading_wallet(user_uuid)
-    bal_col = "real_usdt" if mode == "real" else "demo_usdt"
-    bal = float(wallet.get(bal_col) or 0.0)
-
-    use_binance_api = (
-        mode == "real"
-        and bool(wallet.get("binance_api_key"))
-        and bool(wallet.get("binance_api_secret"))
+    open_positions = await run_db(
+        lambda: supabase.table("trading_positions")
+        .select("*")
+        .eq("user_id", user_uuid)
+        .eq("status", "open")
+        .execute()
+        .data
+        or []
     )
 
-    async def _buy(reason: str):
-        nonlocal bal, pos_qty, entry_price
-        if bal < order_usdt:
-            return {"action": "hold", "reason": f"Недостатньо {mode.upper()} USDT (потрібно {order_usdt})"}
+    closed_now = []
+    for pos in open_positions:
+        ticker = str(pos["symbol"]).replace("USDT", "")
+        cur_price = await get_realtime_price(ticker, "crypto", use_cache=False)
+        if not cur_price or cur_price <= 0:
+            continue
+        entry = float(pos["entry_price"])
+        tp = float(pos.get("tp_pct") or 2.8)
+        sl = float(pos.get("sl_pct") or 1.8)
+        chg_pct = ((cur_price - entry) / entry) * 100.0 if entry > 0 else 0.0
 
-        if use_binance_api:
-            ok, msg = await execute_binance_spot_order(
-                wallet["binance_api_key"], wallet["binance_api_secret"], symbol, "BUY", quote_usdt=order_usdt
-            )
-            if not ok:
-                return {"action": "error", "reason": f"Binance API: {msg}"}
+        if chg_pct >= tp:
+            closed_now.append(await close_position_at_price(pos, cur_price, f"Take Profit (+{chg_pct:.2f}%)", tg_bot, user_tg_id))
+        elif chg_pct <= -sl:
+            closed_now.append(await close_position_at_price(pos, cur_price, f"Stop Loss ({chg_pct:.2f}%)", tg_bot, user_tg_id))
 
-        bought_qty = order_usdt / price
-        new_qty = pos_qty + bought_qty
-        new_entry = ((pos_qty * entry_price) + order_usdt) / new_qty if new_qty > 0 else price
-        new_bal = round(bal - order_usdt, 4)
+    # Refresh wallet & open positions count
+    wallet = await get_or_create_demo_wallet(user_uuid)
+    demo_bal = float(wallet.get("demo_usdt") or 0.0)
+    open_positions = await run_db(
+        lambda: supabase.table("trading_positions")
+        .select("*")
+        .eq("user_id", user_uuid)
+        .eq("status", "open")
+        .execute()
+        .data
+        or []
+    )
 
-        def _db_buy():
-            supabase.table("trading_wallets").update({bal_col: new_bal}).eq("user_id", user_uuid).execute()
-            supabase.table("trading_bots").update(
-                {
-                    "position_qty": round(new_qty, 8),
-                    "entry_price": round(new_entry, 4),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-            ).eq("id", bot_id).execute()
-            supabase.table("trading_orders").insert(
-                {
-                    "bot_id": bot_id,
-                    "user_id": user_uuid,
-                    "mode": mode,
-                    "symbol": symbol,
-                    "side": "BUY",
-                    "price": price,
-                    "quantity": round(bought_qty, 8),
-                    "usdt_amount": order_usdt,
-                    "pnl": 0,
-                    "reason": reason,
-                }
-            ).execute()
+    opened_now = []
+    open_symbols = {p["symbol"] for p in open_positions}
+    max_concurrent = 4
 
-        await run_db(_db_buy)
-        if tg_bot and user_tg_id:
-            try:
-                await tg_bot.send_message(
-                    user_tg_id,
-                    f"🤖 <b>[{mode.upper()}] Купівля {symbol}</b>\n"
-                    f"💵 Сума: <b>{order_usdt:.2f} USDT</b> @ <b>${price:,.4f}</b>\n"
-                    f"📌 Причина: <i>{reason}</i>",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-        return {"action": "BUY", "price": price, "quantity": round(bought_qty, 6), "reason": reason}
+    if len(open_positions) < max_concurrent and demo_bal >= 50.0:
+        auto_select = bool(cfg.get("auto_select", True))
+        chosen = [str(s).upper() for s in (cfg.get("symbols") or []) if s]
+        candidates = ALL_PAIRS if (auto_select or not chosen) else chosen
+        candidates = [s for s in candidates if s not in open_symbols]
 
-    async def _sell(reason: str):
-        nonlocal bal, pos_qty, entry_price, realized_pnl
-        if pos_qty <= 0:
-            return {"action": "hold", "reason": "Немає відкритої позиції"}
+        if candidates:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as session:
+                signals = await asyncio.gather(*(_analyze_pair_signal(session, s) for s in candidates))
+            valid = [s for s in signals if s is not None and s["score"] > 0]
+            if not valid:
+                # Fallback to live price on first candidate if klines unavailable
+                for s in candidates[:2]:
+                    p = await get_realtime_price(s.replace("USDT", ""), "crypto", use_cache=False)
+                    if p and p > 0:
+                        valid.append({"symbol": s, "price": p, "rsi": 50.0, "score": 10.0, "strategy": "Market Entry"})
+                        break
 
-        if use_binance_api:
-            ok, msg = await execute_binance_spot_order(
-                wallet["binance_api_key"], wallet["binance_api_secret"], symbol, "SELL", quantity=pos_qty
-            )
-            if not ok:
-                return {"action": "error", "reason": f"Binance API: {msg}"}
+            if valid:
+                best = max(valid, key=lambda x: x["score"])
+                # Dynamic position sizing: 8%..12% of demo balance based on signal strength
+                alloc_pct = 0.12 if best["score"] >= 25 else 0.08
+                invest_usdt = round(min(max(demo_bal * alloc_pct, 50.0), min(demo_bal, 1500.0)), 2)
+                entry_price = float(best["price"])
+                qty = round(invest_usdt / entry_price, 8)
+                new_bal = round(demo_bal - invest_usdt, 4)
 
-        proceeds = pos_qty * price
-        cost = pos_qty * entry_price
-        pnl = round(proceeds - cost, 4)
-        new_bal = round(bal + proceeds, 4)
-        new_realized = round(realized_pnl + pnl, 4)
+                def _open():
+                    supabase.table("trading_wallets").update(
+                        {"demo_usdt": new_bal, "updated_at": datetime.now(timezone.utc).isoformat()}
+                    ).eq("user_id", user_uuid).execute()
+                    return (
+                        supabase.table("trading_positions")
+                        .insert(
+                            {
+                                "user_id": user_uuid,
+                                "symbol": best["symbol"],
+                                "strategy": best["strategy"],
+                                "usdt_invested": invest_usdt,
+                                "quantity": qty,
+                                "entry_price": round(entry_price, 4),
+                                "tp_pct": 2.8,
+                                "sl_pct": 1.8,
+                                "status": "open",
+                            }
+                        )
+                        .execute()
+                        .data[0]
+                    )
 
-        def _db_sell():
-            supabase.table("trading_wallets").update({bal_col: new_bal}).eq("user_id", user_uuid).execute()
-            supabase.table("trading_bots").update(
-                {
-                    "position_qty": 0,
-                    "entry_price": 0,
-                    "realized_pnl": new_realized,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-            ).eq("id", bot_id).execute()
-            supabase.table("trading_orders").insert(
-                {
-                    "bot_id": bot_id,
-                    "user_id": user_uuid,
-                    "mode": mode,
-                    "symbol": symbol,
-                    "side": "SELL",
-                    "price": price,
-                    "quantity": round(pos_qty, 8),
-                    "usdt_amount": round(proceeds, 4),
-                    "pnl": pnl,
-                    "reason": reason,
-                }
-            ).execute()
+                pos_row = await run_db(_open)
+                opened_now.append(pos_row)
+                if tg_bot and user_tg_id:
+                    try:
+                        await tg_bot.send_message(
+                            user_tg_id,
+                            f"🤖 <b>[DEMO] Відкрито позицію {best['symbol']}</b>\n"
+                            f"💵 Сума: <b>{invest_usdt:.2f} USDT</b> @ <b>${entry_price:,.4f}</b>\n"
+                            f"📊 Сигнал: <i>{best['strategy']}</i>\n"
+                            f"🎯 TP: +2.8% | 🛡 SL: -1.8%",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
 
-        await run_db(_db_sell)
-        if tg_bot and user_tg_id:
-            emoji = "🟢" if pnl >= 0 else "🔴"
-            try:
-                await tg_bot.send_message(
-                    user_tg_id,
-                    f"🤖 <b>[{mode.upper()}] Продаж {symbol}</b>\n"
-                    f"💵 Виручка: <b>{proceeds:.2f} USDT</b> @ <b>${price:,.4f}</b>\n"
-                    f"{emoji} PnL: <b>{pnl:+.2f} USDT</b>\n"
-                    f"📌 Причина: <i>{reason}</i>",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-        return {"action": "SELL", "price": price, "pnl": pnl, "reason": reason}
-
-    # Evaluate strategy
-    if pos_qty <= 0:
-        if strategy == "momentum":
-            rsi = await fetch_rsi_14(symbol)
-            if rsi is not None and rsi > 65:
-                return {"action": "hold", "reason": f"RSI={rsi} (перекупленість >65, чекаємо відкату)"}
-            return await _buy(f"Momentum вхід (RSI={rsi or 'N/A'})")
-        return await _buy(f"Відкриття позиції ({strategy.upper()})")
-
-    # Position is open -> check TP / SL / DCA
-    pnl_pct = ((price - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
-    if pnl_pct >= tp_pct:
-        return await _sell(f"Take Profit (+{pnl_pct:.2f}%)")
-    if pnl_pct <= -sl_pct:
-        if strategy == "dca" and bal >= order_usdt:
-            return await _buy(f"DCA усереднення ({pnl_pct:.2f}%)")
-        return await _sell(f"Stop Loss ({pnl_pct:.2f}%)")
-
-    return {"action": "hold", "price": price, "pnl_pct": round(pnl_pct, 2), "reason": f"Позиція активна ({pnl_pct:+.2f}%)"}
+    return {"opened": len(opened_now), "closed": len(closed_now), "demo_usdt": demo_bal}
 
 
 async def run_trading_bots_loop(tg_bot) -> None:
-    """Background loop executing active VIP trading bots every 60 seconds."""
+    """Background loop executing active VIP demo trading bots every 60 seconds."""
     while True:
         try:
             bots = await run_db(
-                lambda: supabase.table("trading_bots").select("*").eq("is_active", True).execute().data or []
+                lambda: supabase.table("trading_bots").select("user_id").eq("is_active", True).execute().data or []
             )
             if bots:
                 uids = list({b["user_id"] for b in bots})
@@ -270,8 +259,8 @@ async def run_trading_bots_loop(tg_bot) -> None:
                     lambda: supabase.table("users").select("id, telegram_id").in_("id", uids).execute().data or []
                 )
                 uid_to_tg = {u["id"]: u["telegram_id"] for u in users}
-                for b in bots:
-                    await step_trading_bot(b, tg_bot=tg_bot, user_tg_id=uid_to_tg.get(b["user_id"]))
+                for uid in uids:
+                    await step_autonomous_bot(uid, tg_bot=tg_bot, user_tg_id=uid_to_tg.get(uid))
         except Exception as e:
-            logging.debug(f"Trading bots loop skipped: {e}")
+            logging.debug(f"Trading loop skipped: {e}")
         await asyncio.sleep(60)

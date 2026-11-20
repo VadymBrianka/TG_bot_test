@@ -1,11 +1,17 @@
-import logging
+import asyncio
 from datetime import datetime, timezone
 from aiohttp import web
 
-from db import supabase, run_db, get_exchange_rates, create_transaction_atomic
-from services.subscriptions import require_plan, get_crypto_wallets
-from services.blockchain_verify import verify_crypto_payment
-from services.trading_bot import get_or_create_trading_wallet, step_trading_bot
+from db import supabase, run_db
+from services.subscriptions import require_plan
+from services.market_quotes import get_realtime_price
+from services.trading_bot import (
+    ALL_PAIRS,
+    get_or_create_demo_wallet,
+    get_or_create_bot_config,
+    step_autonomous_bot,
+    close_position_at_price,
+)
 
 
 async def handle_trading_overview(request: web.Request):
@@ -15,41 +21,140 @@ async def handle_trading_overview(request: web.Request):
 
     user_uuid: str = request["user_uuid"]
     try:
-        wallet = await get_or_create_trading_wallet(user_uuid)
-        bots = await run_db(
-            lambda: supabase.table("trading_bots")
+        wallet = await get_or_create_demo_wallet(user_uuid)
+        cfg = await get_or_create_bot_config(user_uuid)
+
+        open_rows = await run_db(
+            lambda: supabase.table("trading_positions")
             .select("*")
             .eq("user_id", user_uuid)
-            .order("created_at", desc=True)
+            .eq("status", "open")
+            .order("opened_at", desc=True)
             .execute()
             .data
             or []
         )
-        orders = await run_db(
-            lambda: supabase.table("trading_orders")
+        closed_rows = await run_db(
+            lambda: supabase.table("trading_positions")
             .select("*")
             .eq("user_id", user_uuid)
-            .order("created_at", desc=True)
-            .limit(30)
+            .eq("status", "closed")
+            .order("closed_at", desc=True)
+            .limit(100)
             .execute()
             .data
             or []
         )
-        deposit_wallets = await get_crypto_wallets()
+
+        # Enrich open positions with live prices & unrealized PnL
+        if open_rows:
+            tickers = list({str(p["symbol"]).replace("USDT", "") for p in open_rows})
+            prices_list = await asyncio.gather(*(get_realtime_price(t, "crypto", use_cache=True) for t in tickers))
+            price_map = {t: p for t, p in zip(tickers, prices_list)}
+            for p in open_rows:
+                t = str(p["symbol"]).replace("USDT", "")
+                cur_p = price_map.get(t) or float(p["entry_price"])
+                entry_p = float(p["entry_price"])
+                qty = float(p["quantity"])
+                invested = float(p["usdt_invested"])
+                cur_val = qty * cur_p
+                unr_pnl = round(cur_val - invested, 2)
+                unr_pct = round(((cur_p - entry_p) / entry_p) * 100.0, 2) if entry_p > 0 else 0.0
+                p["current_price"] = round(cur_p, 4)
+                p["unrealized_pnl"] = unr_pnl
+                p["unrealized_pct"] = unr_pct
+
+        total_realized = round(sum(float(c.get("pnl_usdt") or 0) for c in closed_rows), 2)
+        wins = sum(1 for c in closed_rows if float(c.get("pnl_usdt") or 0) > 0)
+        win_rate = round((wins / len(closed_rows)) * 100, 1) if closed_rows else 0.0
+
         return web.json_response(
             {
-                "wallet": {
-                    "demo_usdt": float(wallet.get("demo_usdt") or 0),
-                    "real_usdt": float(wallet.get("real_usdt") or 0),
-                    "has_binance_keys": bool(wallet.get("binance_api_key") and wallet.get("binance_api_secret")),
+                "demo_usdt": float(wallet.get("demo_usdt") or 0),
+                "bot": cfg,
+                "all_pairs": ALL_PAIRS,
+                "open_positions": open_rows,
+                "closed_positions": closed_rows,
+                "stats": {
+                    "total_realized_pnl": total_realized,
+                    "win_rate": win_rate,
+                    "total_closed": len(closed_rows),
                 },
-                "bots": bots,
-                "orders": orders,
-                "deposit_wallets": deposit_wallets,
             }
         )
     except Exception as e:
         return web.json_response({"error": f"Виконайте migrations.sql у Supabase: {e}"}, status=400)
+
+
+async def handle_trading_save_bot(request: web.Request):
+    denied = await require_plan(request, "vip")
+    if denied:
+        return denied
+
+    user_uuid: str = request["user_uuid"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    await get_or_create_bot_config(user_uuid)
+    auto_select = bool(body.get("auto_select", True))
+    symbols = [str(s).upper() for s in (body.get("symbols") or []) if s]
+    is_active = bool(body.get("is_active", True))
+
+    res = await run_db(
+        lambda: supabase.table("trading_bots")
+        .update(
+            {
+                "auto_select": auto_select,
+                "symbols": symbols,
+                "is_active": is_active,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        .eq("user_id", user_uuid)
+        .execute()
+    )
+    return web.json_response({"status": "saved", "bot": res.data[0] if res.data else {}})
+
+
+async def handle_trading_step(request: web.Request):
+    denied = await require_plan(request, "vip")
+    if denied:
+        return denied
+
+    user_uuid: str = request["user_uuid"]
+    res = await step_autonomous_bot(user_uuid, tg_bot=request.app.get("bot"), user_tg_id=request["tg_id"])
+    return web.json_response(res)
+
+
+async def handle_trading_close_position(request: web.Request):
+    denied = await require_plan(request, "vip")
+    if denied:
+        return denied
+
+    pos_id = request.match_info.get("id")
+    user_uuid: str = request["user_uuid"]
+    rows = await run_db(
+        lambda: supabase.table("trading_positions")
+        .select("*")
+        .eq("id", pos_id)
+        .eq("user_id", user_uuid)
+        .eq("status", "open")
+        .limit(1)
+        .execute()
+        .data
+    )
+    if not rows:
+        return web.json_response({"error": "Позицію не знайдено"}, status=404)
+
+    pos = rows[0]
+    cur_price = await get_realtime_price(str(pos["symbol"]).replace("USDT", ""), "crypto", use_cache=False)
+    if not cur_price or cur_price <= 0:
+        cur_price = float(pos["entry_price"])
+
+    res = await close_position_at_price(pos, cur_price, "Закрито вручну", request.app.get("bot"), request["tg_id"])
+    return web.json_response({"status": "closed", **res})
 
 
 async def handle_trading_demo_reset(request: web.Request):
@@ -58,7 +163,10 @@ async def handle_trading_demo_reset(request: web.Request):
         return denied
 
     user_uuid: str = request["user_uuid"]
-    await get_or_create_trading_wallet(user_uuid)
+    await get_or_create_demo_wallet(user_uuid)
+    await run_db(
+        lambda: supabase.table("trading_positions").delete().eq("user_id", user_uuid).eq("status", "open").execute()
+    )
     await run_db(
         lambda: supabase.table("trading_wallets")
         .update({"demo_usdt": 10000.0, "updated_at": datetime.now(timezone.utc).isoformat()})
@@ -66,243 +174,3 @@ async def handle_trading_demo_reset(request: web.Request):
         .execute()
     )
     return web.json_response({"status": "reset", "demo_usdt": 10000.0})
-
-
-async def handle_trading_transfer(request: web.Request):
-    denied = await require_plan(request, "vip")
-    if denied:
-        return denied
-
-    user_uuid: str = request["user_uuid"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "Некоректний JSON"}, status=400)
-
-    account_id = str(body.get("account_id") or "").strip()
-    direction = str(body.get("direction") or "deposit").lower()  # deposit | withdraw
-    amount_usdt = float(body.get("amount_usdt") or 0)
-    if not account_id or amount_usdt <= 0 or direction not in ("deposit", "withdraw"):
-        return web.json_response({"error": "Некоректні параметри переказу"}, status=400)
-
-    acc_res = await run_db(
-        lambda: supabase.table("accounts")
-        .select("*")
-        .eq("id", account_id)
-        .eq("user_id", user_uuid)
-        .limit(1)
-        .execute()
-        .data
-    )
-    if not acc_res:
-        return web.json_response({"error": "Рахунок не знайдено"}, status=404)
-    acc = acc_res[0]
-
-    rates = await get_exchange_rates()
-    usd_rate = rates.get("USD", 41.5)
-    acc_curr = str(acc.get("currency") or "UAH").upper()
-    acc_rate = 1.0 if acc_curr == "UAH" else rates.get(acc_curr, usd_rate if acc_curr == "USDT" else 1.0)
-    amount_in_acc = round(amount_usdt * (usd_rate / acc_rate), 2)
-
-    wallet = await get_or_create_trading_wallet(user_uuid)
-    real_usdt = float(wallet.get("real_usdt") or 0)
-
-    if direction == "deposit":
-        if float(acc["balance"]) < amount_in_acc:
-            return web.json_response(
-                {"error": f"Недостатньо коштів на рахунку ({amount_in_acc} {acc_curr})"},
-                status=400,
-            )
-        await create_transaction_atomic(
-            user_uuid=user_uuid,
-            account_id=account_id,
-            to_account_id=None,
-            category_id=None,
-            amount=amount_in_acc,
-            target_amount=None,
-            tx_type="expense",
-            note=f"🤖 Поповнення торгового рахунку ({amount_usdt} USDT)",
-        )
-        new_real = round(real_usdt + amount_usdt, 4)
-        await run_db(
-            lambda: supabase.table("trading_wallets")
-            .update({"real_usdt": new_real, "updated_at": datetime.now(timezone.utc).isoformat()})
-            .eq("user_id", user_uuid)
-            .execute()
-        )
-        return web.json_response({"status": "deposited", "real_usdt": new_real})
-
-    else:
-        if real_usdt < amount_usdt:
-            return web.json_response({"error": "Недостатньо USDT на торговому рахунку"}, status=400)
-        new_real = round(real_usdt - amount_usdt, 4)
-        await run_db(
-            lambda: supabase.table("trading_wallets")
-            .update({"real_usdt": new_real, "updated_at": datetime.now(timezone.utc).isoformat()})
-            .eq("user_id", user_uuid)
-            .execute()
-        )
-        await create_transaction_atomic(
-            user_uuid=user_uuid,
-            account_id=account_id,
-            to_account_id=None,
-            category_id=None,
-            amount=amount_in_acc,
-            target_amount=None,
-            tx_type="income",
-            note=f"🤖 Виведення з торгового рахунку ({amount_usdt} USDT)",
-        )
-        return web.json_response({"status": "withdrawn", "real_usdt": new_real})
-
-
-async def handle_trading_crypto_deposit(request: web.Request):
-    denied = await require_plan(request, "vip")
-    if denied:
-        return denied
-
-    user_uuid: str = request["user_uuid"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "Некоректний JSON"}, status=400)
-
-    network_key = str(body.get("network_key") or "USDT_TRC20").strip()
-    tx_hash = str(body.get("tx_hash") or "").strip()
-    amount_usdt = float(body.get("amount_usdt") or 0)
-    if not tx_hash or amount_usdt <= 0:
-        return web.json_response({"error": "Вкажіть суму USDT та TX Hash"}, status=400)
-
-    wallets = await get_crypto_wallets()
-    expected_wallet = wallets.get(network_key, "")
-    ok, msg = await verify_crypto_payment(network_key, tx_hash, expected_wallet, amount_usdt)
-    if not ok:
-        return web.json_response({"error": f"Не вдалося підтвердити переказ: {msg}"}, status=400)
-
-    wallet = await get_or_create_trading_wallet(user_uuid)
-    new_real = round(float(wallet.get("real_usdt") or 0) + amount_usdt, 4)
-    await run_db(
-        lambda: supabase.table("trading_wallets")
-        .update({"real_usdt": new_real, "updated_at": datetime.now(timezone.utc).isoformat()})
-        .eq("user_id", user_uuid)
-        .execute()
-    )
-    return web.json_response({"status": "credited", "real_usdt": new_real, "message": msg})
-
-
-async def handle_trading_save_binance_keys(request: web.Request):
-    denied = await require_plan(request, "vip")
-    if denied:
-        return denied
-
-    user_uuid: str = request["user_uuid"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "Некоректний JSON"}, status=400)
-
-    api_key = str(body.get("api_key") or "").strip()
-    api_secret = str(body.get("api_secret") or "").strip()
-    await get_or_create_trading_wallet(user_uuid)
-    await run_db(
-        lambda: supabase.table("trading_wallets")
-        .update(
-            {
-                "binance_api_key": api_key,
-                "binance_api_secret": api_secret,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-        .eq("user_id", user_uuid)
-        .execute()
-    )
-    return web.json_response({"status": "saved", "has_binance_keys": bool(api_key and api_secret)})
-
-
-async def handle_trading_create_bot(request: web.Request):
-    denied = await require_plan(request, "vip")
-    if denied:
-        return denied
-
-    user_uuid: str = request["user_uuid"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "Некоректний JSON"}, status=400)
-
-    mode = str(body.get("mode") or "demo").lower()
-    symbol = str(body.get("symbol") or "BTCUSDT").upper()
-    strategy = str(body.get("strategy") or "tp_sl").lower()
-    order_usdt = float(body.get("order_usdt") or 50)
-    tp = float(body.get("take_profit_pct") or 3.0)
-    sl = float(body.get("stop_loss_pct") or 2.0)
-
-    if mode not in ("demo", "real") or strategy not in ("tp_sl", "dca", "momentum") or order_usdt <= 0:
-        return web.json_response({"error": "Некоректні параметри бота"}, status=400)
-
-    await get_or_create_trading_wallet(user_uuid)
-    res = await run_db(
-        lambda: supabase.table("trading_bots")
-        .insert(
-            {
-                "user_id": user_uuid,
-                "mode": mode,
-                "symbol": symbol,
-                "strategy": strategy,
-                "order_usdt": order_usdt,
-                "take_profit_pct": tp,
-                "stop_loss_pct": sl,
-                "is_active": True,
-            }
-        )
-        .execute()
-    )
-    return web.json_response({"status": "created", "bot": res.data[0]})
-
-
-async def handle_trading_toggle_bot(request: web.Request):
-    denied = await require_plan(request, "vip")
-    if denied:
-        return denied
-
-    bot_id = request.match_info.get("id")
-    user_uuid: str = request["user_uuid"]
-    rows = await run_db(
-        lambda: supabase.table("trading_bots").select("is_active").eq("id", bot_id).eq("user_id", user_uuid).limit(1).execute().data
-    )
-    if not rows:
-        return web.json_response({"error": "Бота не знайдено"}, status=404)
-    new_state = not bool(rows[0]["is_active"])
-    await run_db(
-        lambda: supabase.table("trading_bots").update({"is_active": new_state}).eq("id", bot_id).eq("user_id", user_uuid).execute()
-    )
-    return web.json_response({"status": "toggled", "is_active": new_state})
-
-
-async def handle_trading_step_bot(request: web.Request):
-    denied = await require_plan(request, "vip")
-    if denied:
-        return denied
-
-    bot_id = request.match_info.get("id")
-    user_uuid: str = request["user_uuid"]
-    rows = await run_db(
-        lambda: supabase.table("trading_bots").select("*").eq("id", bot_id).eq("user_id", user_uuid).limit(1).execute().data
-    )
-    if not rows:
-        return web.json_response({"error": "Бота не знайдено"}, status=404)
-
-    result = await step_trading_bot(rows[0], tg_bot=request.app.get("bot"), user_tg_id=request["tg_id"])
-    return web.json_response(result)
-
-
-async def handle_trading_delete_bot(request: web.Request):
-    denied = await require_plan(request, "vip")
-    if denied:
-        return denied
-
-    bot_id = request.match_info.get("id")
-    user_uuid: str = request["user_uuid"]
-    await run_db(
-        lambda: supabase.table("trading_bots").delete().eq("id", bot_id).eq("user_id", user_uuid).execute()
-    )
-    return web.json_response({"status": "deleted"})
