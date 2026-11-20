@@ -7,6 +7,8 @@ from aiogram.types import Message, WebAppInfo, MenuButtonWebApp, BufferedInputFi
 from config import MINIAPP_URL
 from db import supabase, run_db, get_user_uuid_by_tg_id, get_exchange_rates, is_admin
 from services.export_csv import build_transactions_csv
+from services.advisor_ai import generate_financial_advice
+from services.subscriptions import get_user_subscription, has_plan
 
 router = Router()
 
@@ -16,6 +18,7 @@ USER_COMMANDS = [
     BotCommand(command="today", description="Доходи та витрати за сьогодні"),
     BotCommand(command="month", description="Фінансовий звіт за місяць"),
     BotCommand(command="stats", description="Топ-5 категорій витрат за місяць"),
+    BotCommand(command="advice", description="🧠 ШІ Фінансовий радник (Pro+)"),
     BotCommand(command="debts", description="Борги та позики"),
     BotCommand(command="debt", description="Додати борг: /debt мені Олег 500 UAH"),
     BotCommand(command="goals", description="Мої цілі накопичення"),
@@ -595,3 +598,24 @@ async def cmd_add_debt(message: Message):
         await message.reply(f"🤝 Записано! {label} <b>{person}</b>: <b>{amount:,.2f} {curr}</b>", parse_mode="HTML")
     except Exception as e:
         await message.reply(f"❌ Помилка: {e}")
+
+
+@router.message(Command("advice"))
+async def cmd_advice(message: Message):
+    if not message.from_user:
+        return
+    sub = await get_user_subscription(message.from_user.id)
+    if not has_plan(sub["plan"], "pro"):
+        await message.reply("🔒 <b>ШІ Фінансовий радник доступний на тарифі Pro або VIP.</b>\nОформити: /subscribe", parse_mode="HTML")
+        return
+
+    user_uuid = await get_user_uuid_by_tg_id(message.from_user.id)
+    if not user_uuid:
+        return
+
+    wait_msg = await message.reply("🧠 Аналізую ваші фінанси за 30 днів...")
+    try:
+        advice = await generate_financial_advice(user_uuid)
+        await wait_msg.edit_text(f"🧠 <b>Персональна порада FinTrack AI:</b>\n\n{advice}")
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ Не вдалося сформувати пораду: {e}")

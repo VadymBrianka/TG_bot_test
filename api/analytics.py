@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from aiohttp import web
 from db import supabase, run_db, get_exchange_rates
 from services.subscriptions import require_plan
+from services.advisor_ai import generate_financial_advice
 
 
 async def handle_analytics_and_forecast(request: web.Request):
@@ -186,3 +187,19 @@ async def handle_analytics_and_forecast(request: web.Request):
     except Exception as e:
         logging.error(f"Analytics error: {e}")
         return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_analytics_advice(request: web.Request):
+    denied = await require_plan(request, "pro")
+    if denied:
+        return denied
+
+    user_uuid: str = request["user_uuid"]
+    try:
+        advice = await generate_financial_advice(user_uuid)
+        return web.json_response({"advice": advice})
+    except ValueError as ve:
+        return web.json_response({"error": str(ve)}, status=400)
+    except Exception as e:
+        logging.error(f"Advice error: {e}")
+        return web.json_response({"error": str(e) or "Помилка ШІ-радника"}, status=502)

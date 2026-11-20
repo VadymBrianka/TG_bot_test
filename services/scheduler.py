@@ -7,7 +7,72 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from db import supabase, run_db, get_exchange_rates
 from services.nbu import update_rates_from_nbu
 from services.market_quotes import get_realtime_price
-from services.subscriptions import downgrade_expired_subscriptions
+from services.subscriptions import downgrade_expired_subscriptions, get_crypto_wallets, activate_subscription
+from services.blockchain_verify import verify_crypto_payment
+
+
+async def _claim_schedule_slot(key: str, slot_value: str) -> bool:
+    """Distributed lock via app_settings so overlapping Render containers don't double-send."""
+    try:
+        def _check_and_set():
+            res = supabase.table("app_settings").select("value").eq("key", key).limit(1).execute().data
+            if res and res[0].get("value") == slot_value:
+                return False
+            supabase.table("app_settings").upsert(
+                {"key": key, "value": slot_value, "updated_at": datetime.now(timezone.utc).isoformat()},
+                on_conflict="key",
+            ).execute()
+            return True
+        return await run_db(_check_and_set)
+    except Exception:
+        return True
+
+
+async def _recheck_pending_crypto_payments(bot: Bot) -> None:
+    """Re-verify pending crypto subscription payments in the background."""
+    try:
+        pending = await run_db(
+            lambda: supabase.table("subscription_payments")
+            .select("*")
+            .eq("status", "pending")
+            .eq("payment_method", "crypto")
+            .limit(15)
+            .execute()
+            .data
+            or []
+        )
+        if not pending:
+            return
+        wallets = await get_crypto_wallets()
+        for p in pending:
+            tx_hash = str(p.get("tx_hash") or "").strip()
+            if not tx_hash:
+                continue
+            curr = str(p.get("currency") or "USDT").upper()
+            net_key = "USDC_BEP20" if curr == "USDC" else "USDT_TRC20"
+            wallet = wallets.get(net_key, "")
+            if not wallet:
+                continue
+            ok, _ = await verify_crypto_payment(net_key, tx_hash, wallet, float(p.get("amount") or 0))
+            if ok:
+                new_exp = await activate_subscription(p["user_id"], p["plan"], p["period"])
+                await run_db(
+                    lambda pid=p["id"]: supabase.table("subscription_payments")
+                    .update({"status": "approved"})
+                    .eq("id", pid)
+                    .execute()
+                )
+                try:
+                    await bot.send_message(
+                        p["telegram_id"],
+                        f"🎉 <b>Оплату підтверджено в блокчейні!</b>\n"
+                        f"Активовано тариф <b>{p['plan'].upper()}</b> до <b>{new_exp[:10]}</b>.",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        logging.debug(f"Pending crypto recheck skipped: {e}")
 
 
 async def _check_price_alerts(bot: Bot) -> None:
@@ -222,10 +287,72 @@ async def _run_daily_notifications(bot: Bot) -> None:
             logging.debug(f"Weekly digest skipped: {e}")
 
 
+async def _run_evening_reminders(bot: Bot) -> None:
+    try:
+        users = await run_db(lambda: supabase.table("users").select("telegram_id, daily_reminder, is_banned").execute().data or [])
+        for u in users:
+            if u.get("is_banned") or not u.get("daily_reminder") or not u.get("telegram_id"):
+                continue
+            try:
+                await bot.send_message(
+                    u["telegram_id"],
+                    "⏰ <b>Вечірнє нагадування FinTrack Hub</b>\n"
+                    "Не забудьте записати сьогоднішні витрати (надішліть <code>Кава 75</code>, голосове або фото чеку)!",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        logging.debug(f"Evening reminder skipped: {e}")
+
+
+async def _run_monthly_digest(bot: Bot) -> None:
+    try:
+        rates = await get_exchange_rates()
+        month_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        users = await run_db(lambda: supabase.table("users").select("*").execute().data or [])
+        for u in users:
+            if u.get("is_banned") or u.get("monthly_digest") is False:
+                continue
+            tg_id = u.get("telegram_id")
+            uid = u.get("id")
+            if not tg_id or not uid:
+                continue
+            accs = await run_db(
+                lambda u_id=uid: supabase.table("accounts").select("id, currency").eq("user_id", u_id).execute().data or []
+            )
+            acc_curr = {a["id"]: str(a.get("currency") or "UAH").upper() for a in accs}
+            txs = await run_db(
+                lambda u_id=uid: supabase.table("transactions")
+                .select("amount, type, account_id")
+                .eq("user_id", u_id)
+                .gte("transaction_date", month_ago)
+                .execute()
+                .data
+                or []
+            )
+            inc = sum(float(t["amount"]) * rates.get(acc_curr.get(t.get("account_id"), "UAH"), 1.0) for t in txs if t.get("type") == "income")
+            exp = sum(float(t["amount"]) * rates.get(acc_curr.get(t.get("account_id"), "UAH"), 1.0) for t in txs if t.get("type") == "expense")
+            if inc == 0 and exp == 0:
+                continue
+            try:
+                await bot.send_message(
+                    tg_id,
+                    f"📅 <b>Місячний фінансовий звіт:</b>\n\n"
+                    f"🟢 Доходи: <b>+{inc:,.2f} UAH</b>\n"
+                    f"🔴 Витрати: <b>-{exp:,.2f} UAH</b>\n"
+                    f"💵 Чисте сальдо: <b>{(inc - exp):+,.2f} UAH</b>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        logging.debug(f"Monthly digest skipped: {e}")
+
+
 async def start_scheduler(bot: Bot) -> None:
-    """Periodic background scheduler for NBU rates (6h), price alerts (15m), and daily digests/reminders."""
+    """Periodic background scheduler for NBU rates (6h), price alerts, pending crypto, and daily/monthly digests."""
     last_nbu_ts = 0.0
-    last_daily_date: date | None = None
 
     while True:
         try:
@@ -235,12 +362,24 @@ async def start_scheduler(bot: Bot) -> None:
                 last_nbu_ts = now_mono
 
             await _check_price_alerts(bot)
+            await _recheck_pending_crypto_payments(bot)
             await downgrade_expired_subscriptions(bot)
 
-            today = datetime.now(timezone.utc).date()
-            if last_daily_date != today:
+            now_utc = datetime.now(timezone.utc)
+            today_str = now_utc.date().isoformat()
+
+            if await _claim_schedule_slot("scheduler_last_daily", today_str):
                 await _run_daily_notifications(bot)
-                last_daily_date = today
+
+            if now_utc.day == 1:
+                month_slot = now_utc.strftime("%Y-%m")
+                if await _claim_schedule_slot("scheduler_last_monthly", month_slot):
+                    await _run_monthly_digest(bot)
+
+            # 18:00 UTC ~= 20:00 Kyiv
+            if now_utc.hour == 18:
+                if await _claim_schedule_slot("scheduler_last_reminder", today_str):
+                    await _run_evening_reminders(bot)
         except Exception as e:
             logging.error(f"Scheduler loop error: {e}")
 

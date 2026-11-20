@@ -351,3 +351,92 @@ async def handle_import_csv(request: web.Request):
         )
         imported += 1
     return web.json_response({"status": "success", "imported": imported})
+
+
+# --- CASHFLOW CALENDAR (PRO+) ---
+
+async def handle_get_calendar(request: web.Request):
+    denied = await require_plan(request, "pro")
+    if denied:
+        return denied
+
+    user_uuid: str = request["user_uuid"]
+    now = datetime.now(timezone.utc)
+    year = int(request.query.get("year") or now.year)
+    month = int(request.query.get("month") or now.month)
+    month_prefix = f"{year:04d}-{month:02d}"
+
+    def _load():
+        events = []
+        try:
+            recs = supabase.table("recurring_payments").select("*").eq("user_id", user_uuid).eq("is_active", True).execute().data or []
+            for r in recs:
+                day = min(int(r.get("day_of_month") or 1), 28)
+                events.append(
+                    {
+                        "date": f"{month_prefix}-{day:02d}",
+                        "kind": "recurring",
+                        "title": f"🔁 {r['title']}",
+                        "amount": float(r["amount"]),
+                        "type": r.get("type", "expense"),
+                    }
+                )
+        except Exception:
+            pass
+
+        try:
+            goals = supabase.table("goals").select("title, deadline, target_amount, current_amount, currency").eq("user_id", user_uuid).execute().data or []
+            for g in goals:
+                dl = str(g.get("deadline") or "")
+                if dl.startswith(month_prefix):
+                    events.append(
+                        {
+                            "date": dl[:10],
+                            "kind": "goal",
+                            "title": f"🎯 Дедлайн цілі: {g['title']}",
+                            "amount": float(g["target_amount"]) - float(g["current_amount"]),
+                            "currency": g.get("currency", "UAH"),
+                        }
+                    )
+        except Exception:
+            pass
+
+        try:
+            debts = supabase.table("debts").select("*").eq("user_id", user_uuid).eq("is_settled", False).execute().data or []
+            for d in debts:
+                dd = str(d.get("due_date") or "")
+                if dd.startswith(month_prefix):
+                    events.append(
+                        {
+                            "date": dd[:10],
+                            "kind": "debt",
+                            "title": f"🤝 {'Отримати від' if d['direction'] == 'owed_to_me' else 'Повернути'} {d['person_name']}",
+                            "amount": float(d["amount"]),
+                            "currency": d.get("currency", "UAH"),
+                        }
+                    )
+        except Exception:
+            pass
+
+        try:
+            invs = supabase.table("investments").select("name, ticker, maturity_date, quantity, buy_price_avg, currency").eq("user_id", user_uuid).execute().data or []
+            for inv in invs:
+                md = str(inv.get("maturity_date") or "")
+                if md.startswith(month_prefix):
+                    events.append(
+                        {
+                            "date": md[:10],
+                            "kind": "maturity",
+                            "title": f"🏦 Погашення: {inv.get('name') or inv.get('ticker')}",
+                            "amount": float(inv.get("quantity") or 1) * float(inv.get("buy_price_avg") or 0),
+                            "currency": inv.get("currency", "UAH"),
+                        }
+                    )
+        except Exception:
+            pass
+
+        events.sort(key=lambda x: x["date"])
+        return events
+
+    events = await run_db(_load)
+    return web.json_response({"year": year, "month": month, "events": events})

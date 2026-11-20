@@ -10,6 +10,9 @@ async def check_budget_threshold(bot: Bot, user_uuid: str, tg_id: int, category_
         return
     try:
         def _get_budget():
+            u_res = supabase.table("users").select("budget_alerts_enabled").eq("id", user_uuid).limit(1).execute().data
+            if u_res and u_res[0].get("budget_alerts_enabled") is False:
+                return None
             res = (
                 supabase.table("budgets")
                 .select("*")

@@ -9,6 +9,12 @@ from services.market_quotes import get_realtime_price
 
 ALL_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "TONUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"]
 
+RISK_PROFILES: dict[str, dict[str, Any]] = {
+    "conservative": {"alloc_pct": 0.05, "tp_pct": 2.0, "sl_pct": 1.2, "max_positions": 3},
+    "balanced": {"alloc_pct": 0.10, "tp_pct": 2.8, "sl_pct": 1.8, "max_positions": 4},
+    "aggressive": {"alloc_pct": 0.18, "tp_pct": 4.5, "sl_pct": 2.8, "max_positions": 6},
+}
+
 
 async def get_or_create_demo_wallet(user_uuid: str) -> dict[str, Any]:
     def _q():
@@ -27,7 +33,7 @@ async def get_or_create_bot_config(user_uuid: str) -> dict[str, Any]:
             return res[0]
         ins = (
             supabase.table("trading_bots")
-            .insert({"user_id": user_uuid, "auto_select": True, "symbols": [], "is_active": False})
+            .insert({"user_id": user_uuid, "auto_select": True, "symbols": [], "risk_profile": "balanced", "is_active": False})
             .execute()
             .data
         )
@@ -176,7 +182,9 @@ async def step_autonomous_bot(user_uuid: str, tg_bot=None, user_tg_id: int | Non
 
     opened_now = []
     open_symbols = {p["symbol"] for p in open_positions}
-    max_concurrent = 4
+    profile_key = str(cfg.get("risk_profile") or "balanced").lower()
+    profile = RISK_PROFILES.get(profile_key, RISK_PROFILES["balanced"])
+    max_concurrent = int(profile["max_positions"])
 
     if len(open_positions) < max_concurrent and demo_bal >= 50.0:
         auto_select = bool(cfg.get("auto_select", True))
@@ -198,9 +206,10 @@ async def step_autonomous_bot(user_uuid: str, tg_bot=None, user_tg_id: int | Non
 
             if valid:
                 best = max(valid, key=lambda x: x["score"])
-                # Dynamic position sizing: 8%..12% of demo balance based on signal strength
-                alloc_pct = 0.12 if best["score"] >= 25 else 0.08
-                invest_usdt = round(min(max(demo_bal * alloc_pct, 50.0), min(demo_bal, 1500.0)), 2)
+                alloc_pct = float(profile["alloc_pct"])
+                tp_val = float(profile["tp_pct"])
+                sl_val = float(profile["sl_pct"])
+                invest_usdt = round(min(max(demo_bal * alloc_pct, 50.0), min(demo_bal, 2500.0)), 2)
                 entry_price = float(best["price"])
                 qty = round(invest_usdt / entry_price, 8)
                 new_bal = round(demo_bal - invest_usdt, 4)
@@ -215,12 +224,12 @@ async def step_autonomous_bot(user_uuid: str, tg_bot=None, user_tg_id: int | Non
                             {
                                 "user_id": user_uuid,
                                 "symbol": best["symbol"],
-                                "strategy": best["strategy"],
+                                "strategy": f"{best['strategy']} ({profile_key})",
                                 "usdt_invested": invest_usdt,
                                 "quantity": qty,
                                 "entry_price": round(entry_price, 4),
-                                "tp_pct": 2.8,
-                                "sl_pct": 1.8,
+                                "tp_pct": tp_val,
+                                "sl_pct": sl_val,
                                 "status": "open",
                             }
                         )
@@ -250,17 +259,35 @@ async def run_trading_bots_loop(tg_bot) -> None:
     """Background loop executing active VIP demo trading bots every 60 seconds."""
     while True:
         try:
-            bots = await run_db(
-                lambda: supabase.table("trading_bots").select("user_id").eq("is_active", True).execute().data or []
-            )
-            if bots:
-                uids = list({b["user_id"] for b in bots})
-                users = await run_db(
-                    lambda: supabase.table("users").select("id, telegram_id").in_("id", uids).execute().data or []
+            now_dt = datetime.now(timezone.utc)
+            # Distributed dedup guard across overlapping Render containers
+            def _claim_tick():
+                res = supabase.table("app_settings").select("value").eq("key", "trading_last_tick").limit(1).execute().data
+                if res and res[0].get("value"):
+                    try:
+                        prev = datetime.fromisoformat(str(res[0]["value"]).replace("Z", "+00:00"))
+                        if (now_dt - prev).total_seconds() < 45:
+                            return False
+                    except Exception:
+                        pass
+                supabase.table("app_settings").upsert(
+                    {"key": "trading_last_tick", "value": now_dt.isoformat(), "updated_at": now_dt.isoformat()},
+                    on_conflict="key",
+                ).execute()
+                return True
+
+            if await run_db(_claim_tick):
+                bots = await run_db(
+                    lambda: supabase.table("trading_bots").select("user_id").eq("is_active", True).execute().data or []
                 )
-                uid_to_tg = {u["id"]: u["telegram_id"] for u in users}
-                for uid in uids:
-                    await step_autonomous_bot(uid, tg_bot=tg_bot, user_tg_id=uid_to_tg.get(uid))
+                if bots:
+                    uids = list({b["user_id"] for b in bots})
+                    users = await run_db(
+                        lambda: supabase.table("users").select("id, telegram_id").in_("id", uids).execute().data or []
+                    )
+                    uid_to_tg = {u["id"]: u["telegram_id"] for u in users}
+                    for uid in uids:
+                        await step_autonomous_bot(uid, tg_bot=tg_bot, user_tg_id=uid_to_tg.get(uid))
         except Exception as e:
             logging.debug(f"Trading loop skipped: {e}")
         await asyncio.sleep(60)

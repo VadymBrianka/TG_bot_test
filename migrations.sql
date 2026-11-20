@@ -64,9 +64,32 @@ CREATE TABLE IF NOT EXISTS trading_bots (
   user_id UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   auto_select BOOLEAN NOT NULL DEFAULT TRUE,
   symbols JSONB NOT NULL DEFAULT '[]'::jsonb,
+  risk_profile TEXT NOT NULL DEFAULT 'balanced',
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Safe migration if trading_bots already existed from an earlier schema
+ALTER TABLE trading_bots
+  ADD COLUMN IF NOT EXISTS auto_select BOOLEAN NOT NULL DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS symbols JSONB NOT NULL DEFAULT '[]'::jsonb,
+  ADD COLUMN IF NOT EXISTS risk_profile TEXT NOT NULL DEFAULT 'balanced';
+
+-- Family / Shared budget groups (VIP)
+CREATE TABLE IF NOT EXISTS family_groups (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL DEFAULT 'Сімʼя',
+  invite_code TEXT UNIQUE NOT NULL,
+  owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS family_members (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  group_id UUID NOT NULL REFERENCES family_groups(id) ON DELETE CASCADE,
+  user_id UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  joined_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS trading_positions (

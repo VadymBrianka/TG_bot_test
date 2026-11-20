@@ -13,16 +13,17 @@ from db import (
 )
 from services.budget_alerts import check_budget_threshold
 from services.receipt_ai import parse_receipt_bytes, match_category_id
+from services.voice_ai import parse_voice_transactions
 from services.subscriptions import get_user_subscription, has_plan
 
 router = Router()
 
 INCOME_RE = re.compile(
-    r"^\+\s*(\d+(?:[.,]\d+)?)\s*(UAH|USD|EUR|GBP|PLN|USDT|грн|\$|€)?\s*(.*)$",
+    r"^\+\s*(\d+(?:[.,]\d+)?)\s*(UAH|USDT|USD|EUR|GBP|PLN|грн|\$|€)?\s*(.*)$",
     re.IGNORECASE,
 )
 EXPENSE_RE = re.compile(
-    r"^\s*([^\d\n][^\n]*?)\s+(\d+(?:[.,]\d+)?)\s*(UAH|USD|EUR|GBP|PLN|USDT|грн|\$|€)?\s*$",
+    r"^\s*([^\d\n][^\n]*?)\s+(\d+(?:[.,]\d+)?)\s*(UAH|USDT|USD|EUR|GBP|PLN|грн|\$|€)?\s*$",
     re.IGNORECASE,
 )
 
@@ -333,3 +334,61 @@ async def handle_receipt_document(message: Message):
         await status_msg.edit_text(f"⚠️ {ve}")
     except Exception as e:
         await status_msg.edit_text(f"❌ Не вдалося розпізнати документ: {e}")
+
+
+@router.message(F.voice)
+async def handle_voice_entry(message: Message):
+    if not message.from_user or not message.voice:
+        return
+    sub = await get_user_subscription(message.from_user.id)
+    if not has_plan(sub["plan"], "pro"):
+        await message.reply(
+            "🔒 <b>Голосовий запис витрат доступний на тарифі Pro або VIP.</b>\nОформити: /subscribe",
+            parse_mode="HTML",
+        )
+        return
+
+    user_uuid = await get_user_uuid_by_tg_id(message.from_user.id)
+    if not user_uuid:
+        await message.answer("Спочатку натисніть /start")
+        return
+
+    status_msg = await message.reply("🎙️ Розпізнаю голосове повідомлення...")
+    try:
+        buf = io.BytesIO()
+        await message.bot.download(message.voice, destination=buf)
+        items = await parse_voice_transactions(buf.getvalue(), mime_type="audio/ogg")
+        if not items:
+            await status_msg.edit_text("⚠️ Не вдалося знайти витрати чи доходи у голосовому повідомленні.")
+            return
+
+        lines = ["🎙️ <b>Записано з голосового:</b>\n"]
+        last_tx_id = ""
+        for it in items:
+            acc, final_amt, final_curr, suffix = await _pick_account_and_amount(
+                user_uuid, float(it["amount"]), it.get("currency")
+            )
+            if not acc:
+                continue
+            cat_id, cat_label = await match_category_id(it.get("category_hint", ""))
+            tx = await create_transaction_atomic(
+                user_uuid=user_uuid,
+                account_id=acc["id"],
+                to_account_id=None,
+                category_id=cat_id,
+                amount=final_amt,
+                target_amount=None,
+                tx_type=it["type"],
+                note=f"🎙️ {it['note']}{suffix}"[:450],
+            )
+            last_tx_id = tx.get("id", "")
+            sign = "+" if it["type"] == "income" else "-"
+            emoji = "🟢" if it["type"] == "income" else "🔴"
+            lines.append(f"{emoji} <b>{sign}{final_amt:,.2f} {final_curr}</b> — {it['note']} ({cat_label})")
+            if it["type"] == "expense" and cat_id:
+                await check_budget_threshold(message.bot, user_uuid, message.from_user.id, cat_id)
+
+        kb = _tx_actions_keyboard(last_tx_id) if (last_tx_id and len(items) == 1) else None
+        await status_msg.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Помилка розпізнавання голосу: {e}")

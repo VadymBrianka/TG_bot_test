@@ -68,6 +68,13 @@ async def handle_trading_overview(request: web.Request):
         wins = sum(1 for c in closed_rows if float(c.get("pnl_usdt") or 0) > 0)
         win_rate = round((wins / len(closed_rows)) * 100, 1) if closed_rows else 0.0
 
+        # Build Equity Curve chronologically
+        equity_curve = []
+        cum = 10000.0
+        for c in reversed(closed_rows):
+            cum = round(cum + float(c.get("pnl_usdt") or 0), 2)
+            equity_curve.append({"date": str(c.get("closed_at") or "")[:16], "equity": cum})
+
         return web.json_response(
             {
                 "demo_usdt": float(wallet.get("demo_usdt") or 0),
@@ -75,6 +82,7 @@ async def handle_trading_overview(request: web.Request):
                 "all_pairs": ALL_PAIRS,
                 "open_positions": open_rows,
                 "closed_positions": closed_rows,
+                "equity_curve": equity_curve,
                 "stats": {
                     "total_realized_pnl": total_realized,
                     "win_rate": win_rate,
@@ -100,6 +108,9 @@ async def handle_trading_save_bot(request: web.Request):
     await get_or_create_bot_config(user_uuid)
     auto_select = bool(body.get("auto_select", True))
     symbols = [str(s).upper() for s in (body.get("symbols") or []) if s]
+    risk_profile = str(body.get("risk_profile") or "balanced").lower()
+    if risk_profile not in ("conservative", "balanced", "aggressive"):
+        risk_profile = "balanced"
     is_active = bool(body.get("is_active", True))
 
     res = await run_db(
@@ -108,6 +119,7 @@ async def handle_trading_save_bot(request: web.Request):
             {
                 "auto_select": auto_select,
                 "symbols": symbols,
+                "risk_profile": risk_profile,
                 "is_active": is_active,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -174,3 +186,51 @@ async def handle_trading_demo_reset(request: web.Request):
         .execute()
     )
     return web.json_response({"status": "reset", "demo_usdt": 10000.0})
+
+
+async def handle_trading_leaderboard(request: web.Request):
+    denied = await require_plan(request, "vip")
+    if denied:
+        return denied
+
+    def _load():
+        closed = (
+            supabase.table("trading_positions")
+            .select("user_id, pnl_usdt")
+            .eq("status", "closed")
+            .execute()
+            .data
+            or []
+        )
+        if not closed:
+            return []
+        pnl_by_user: dict[str, dict] = {}
+        for c in closed:
+            uid = c["user_id"]
+            if uid not in pnl_by_user:
+                pnl_by_user[uid] = {"pnl": 0.0, "trades": 0, "wins": 0}
+            p = float(c.get("pnl_usdt") or 0)
+            pnl_by_user[uid]["pnl"] += p
+            pnl_by_user[uid]["trades"] += 1
+            if p > 0:
+                pnl_by_user[uid]["wins"] += 1
+
+        uids = list(pnl_by_user.keys())
+        users = supabase.table("users").select("id, first_name").in_("id", uids).execute().data or []
+        names = {u["id"]: (u.get("first_name") or "Трейдер") for u in users}
+
+        board = []
+        for uid, st in pnl_by_user.items():
+            board.append(
+                {
+                    "name": names.get(uid, "Трейдер"),
+                    "pnl_usdt": round(st["pnl"], 2),
+                    "roi_pct": round((st["pnl"] / 10000.0) * 100.0, 2),
+                    "trades": st["trades"],
+                    "win_rate": round((st["wins"] / st["trades"]) * 100, 1) if st["trades"] else 0.0,
+                }
+            )
+        return sorted(board, key=lambda x: x["pnl_usdt"], reverse=True)[:10]
+
+    board = await run_db(_load)
+    return web.json_response({"leaderboard": board})

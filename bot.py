@@ -32,7 +32,7 @@ from api.investments import (
     handle_delete_investment,
     handle_refresh_investment_prices,
 )
-from api.analytics import handle_analytics_and_forecast
+from api.analytics import handle_analytics_and_forecast, handle_analytics_advice
 from api.market import handle_market_search, handle_market_quote
 from api.categories import handle_get_categories, handle_create_category, handle_delete_category
 from api.features import (
@@ -49,6 +49,7 @@ from api.features import (
     handle_export_csv,
     handle_export_send_telegram,
     handle_import_csv,
+    handle_get_calendar,
 )
 from api.admin import (
     handle_admin_overview,
@@ -73,6 +74,13 @@ from api.trading import (
     handle_trading_step,
     handle_trading_close_position,
     handle_trading_demo_reset,
+    handle_trading_leaderboard,
+)
+from api.family import (
+    handle_family_overview,
+    handle_family_create,
+    handle_family_join,
+    handle_family_leave,
 )
 
 from bot_handlers import admin, commands, quick_entry, callbacks, subscriptions
@@ -133,8 +141,10 @@ def create_web_app() -> web.Application:
     app.router.add_delete("/api/v1/investments/{id}", handle_delete_investment)
     app.router.add_post("/api/v1/investments/refresh-prices", handle_refresh_investment_prices)
 
-    # Analytics
+    # Analytics & Calendar
     app.router.add_get("/api/v1/analytics/forecast", handle_analytics_and_forecast)
+    app.router.add_get("/api/v1/analytics/advice", handle_analytics_advice)
+    app.router.add_get("/api/v1/calendar", handle_get_calendar)
 
     # Budgets, Recurring, Alerts, Settings, CSV
     app.router.add_get("/api/v1/budgets", handle_list_budgets)
@@ -174,6 +184,13 @@ def create_web_app() -> web.Application:
     app.router.add_post("/api/v1/trading/bot/step", handle_trading_step)
     app.router.add_post("/api/v1/trading/positions/{id}/close", handle_trading_close_position)
     app.router.add_post("/api/v1/trading/demo/reset", handle_trading_demo_reset)
+    app.router.add_get("/api/v1/trading/leaderboard", handle_trading_leaderboard)
+
+    # Family Shared Budget (VIP / Pro+)
+    app.router.add_get("/api/v1/family", handle_family_overview)
+    app.router.add_post("/api/v1/family/create", handle_family_create)
+    app.router.add_post("/api/v1/family/join", handle_family_join)
+    app.router.add_post("/api/v1/family/leave", handle_family_leave)
 
     # Admin
     app.router.add_get("/api/v1/admin/overview", handle_admin_overview)
