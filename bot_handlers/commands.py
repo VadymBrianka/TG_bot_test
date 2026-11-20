@@ -2,7 +2,16 @@ import logging
 from datetime import datetime, timezone
 from aiogram import Router
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, WebAppInfo, MenuButtonWebApp, BufferedInputFile, BotCommand, BotCommandScopeChat
+from aiogram.types import (
+    Message,
+    WebAppInfo,
+    MenuButtonWebApp,
+    BufferedInputFile,
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 
 from config import MINIAPP_URL
 from db import supabase, run_db, get_user_uuid_by_tg_id, get_exchange_rates, is_admin
@@ -87,19 +96,27 @@ async def cmd_start(message: Message):
     except Exception as e:
         logging.warning(f"Menu/commands err: {e}")
 
+    start_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💎 Відкрити FinTrack Hub", web_app=WebAppInfo(url=MINIAPP_URL))]
+        ]
+    )
+
     await message.answer(
         f"Вітаю, {user.first_name}! 💼\n\n"
-        "<b>FinTrack Pro</b> готовий до роботи:\n\n"
+        "<b>FinTrack Hub</b> готовий до роботи:\n\n"
         "⚡ <b>Швидкий запис у чаті:</b>\n"
         "• <code>Кава 75</code> або <code>Сільпо 420</code>\n"
         "• <code>Таксі 5 USD</code> (з автоконвертацією або вибором рахунку)\n"
-        "• <code>+25000 Зарплата</code>\n\n"
+        "• <code>+25000 Зарплата</code>\n"
+        "• 🎙️ Голосове повідомлення або 📷 фото чека (для <b>Pro+</b>)\n\n"
         "📋 <b>Основні команди:</b>\n"
-        "• /balance, /today, /month\n"
+        "• /balance, /today, /month, /advice\n"
         "• /goals, /portfolio, /budgets, /recurring\n"
-        "• /alerts, /export, /help\n\n"
-        "Відкривайте додаток кнопкою <b>«Капітал»</b> зліва внизу 🚀",
+        "• /alerts, /subscribe, /export, /help\n\n"
+        "Натисніть кнопку нижче, щоб відкрити Mini App 🚀",
         parse_mode="HTML",
+        reply_markup=start_kb,
     )
 
 

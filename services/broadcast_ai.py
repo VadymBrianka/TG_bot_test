@@ -5,16 +5,45 @@ from typing import Any
 import aiohttp
 
 from config import GEMINI_API_KEY
+from services.subscriptions import PLANS
 
 MODELS_FALLBACK = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.8-flash"]
+
+RECENT_UPDATES = [
+    "Голосовий швидкий ввід (Pro+): надсилай голосове повідомлення в чат бота, а ШІ автоматично розпізнає суму, валюту та категорію.",
+    "ШІ-фінансовий радник (Pro+): команда /advice та персональний аналіз витрат у вкладці Аналітика Mini App.",
+    "Календар грошових потоків (Pro+): візуалізація доходів і витрат по днях у Mini App.",
+    "Оновлення VIP Демо-трейдинг бота: вибір профілю ризику (Conservative / Balanced / Aggressive), графік кривої капіталу (Equity Curve) та VIP Лідерборд.",
+    "Сімейний / спільний капітал (VIP створює, Pro+ приєднується): об'єднання рахунків сім'ї з копіюванням коду запрошення.",
+    "Покращений ШІ-сканер чеків (Pro+): підтримка камери, галереї та документів/PDF на iOS і Android.",
+    "Підписки Pro та VIP: оплата в Telegram Stars або криптовалютою (USDT/USDC/TON) з автоперевіркою в блокчейні та миттєвим копіюванням адреси гаманця.",
+]
+
+
+def _build_product_context() -> str:
+    plans_lines = []
+    for key in ("free", "pro", "vip"):
+        p = PLANS[key]
+        feats = "; ".join(p["features"])
+        plans_lines.append(f"- {p['name']} (${p['usd_month']}/міс або {p['stars_month']} Stars): {feats}")
+    updates_lines = "\n".join(f"- {u}" for u in RECENT_UPDATES)
+    return (
+        "Актуальні тарифи та функції FinTrack Hub:\n"
+        + "\n".join(plans_lines)
+        + "\n\nОстанні нововведення в боті та Mini App:\n"
+        + updates_lines
+    )
 
 
 async def generate_broadcast_draft(topic: str, tone: str = "дружній") -> dict[str, Any]:
     if not GEMINI_API_KEY:
         raise ValueError("ШІ-генератор не налаштовано: додайте GEMINI_API_KEY у змінні середовища сервера.")
 
-    prompt = f"""Ти — копірайтер і маркетинг-агент фінансового Telegram-бота FinTrack Hub (облік витрат, рахунки, цілі, інвестиції, борги, ШІ-сканер чеків).
+    product_context = _build_product_context()
+    prompt = f"""Ти — копірайтер і маркетинг-агент фінансового Telegram-бота FinTrack Hub.
 Напиши коротку, яскраву та корисну статтю/оголошення для розсилки користувачам у Telegram українською мовою.
+
+{product_context}
 
 Тема / ідея від адміністратора: "{topic}"
 Тон тексту: {tone}
