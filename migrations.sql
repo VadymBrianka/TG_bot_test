@@ -38,6 +38,20 @@ CREATE TABLE IF NOT EXISTS app_settings (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Subscription giveaways
+CREATE TABLE IF NOT EXISTS giveaways (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  title TEXT NOT NULL,
+  plan TEXT NOT NULL CHECK (plan IN ('pro', 'vip')),
+  duration_days INT NOT NULL DEFAULT 30 CHECK (duration_days > 0),
+  winners_count INT NOT NULL DEFAULT 1 CHECK (winners_count > 0),
+  participants JSONB NOT NULL DEFAULT '[]'::jsonb,
+  winners JSONB NOT NULL DEFAULT '[]'::jsonb,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'finished')),
+  created_by BIGINT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Broadcast history table for admin panel
 CREATE TABLE IF NOT EXISTS broadcast_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

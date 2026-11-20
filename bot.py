@@ -60,6 +60,8 @@ from api.admin import (
     handle_admin_set_subscription,
     handle_admin_review_payment,
     handle_admin_save_wallets,
+    handle_admin_create_giveaway,
+    handle_admin_draw_giveaway,
 )
 from api.receipts import handle_parse_receipt
 from api.debts import handle_list_debts, handle_create_debt, handle_settle_debt, handle_delete_debt
@@ -166,6 +168,8 @@ def create_web_app() -> web.Application:
     app.router.add_post("/api/v1/admin/users/{id}/dm", handle_admin_send_dm)
     app.router.add_post("/api/v1/admin/payments/{id}/review", handle_admin_review_payment)
     app.router.add_put("/api/v1/admin/wallets", handle_admin_save_wallets)
+    app.router.add_post("/api/v1/admin/giveaways", handle_admin_create_giveaway)
+    app.router.add_post("/api/v1/admin/giveaways/{id}/draw", handle_admin_draw_giveaway)
     app.router.add_post("/api/v1/admin/broadcast", handle_admin_broadcast)
     app.router.add_post("/api/v1/admin/broadcast/generate", handle_admin_generate_broadcast)
     app.router.add_post("/api/v1/admin/refresh-rates", handle_admin_refresh_rates)

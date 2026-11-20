@@ -118,8 +118,13 @@ async def require_plan(request: web.Request, min_plan: str) -> web.Response | No
     return None
 
 
-async def activate_subscription(user_uuid: str, plan: str, period: str) -> str:
-    days = 365 if period == "year" else 30
+async def activate_subscription(
+    user_uuid: str,
+    plan: str,
+    period: str = "month",
+    custom_days: int | None = None,
+) -> str:
+    days = custom_days if (custom_days and custom_days > 0) else (365 if period == "year" else 30)
 
     def _update():
         now = datetime.now(timezone.utc)
@@ -168,3 +173,45 @@ async def get_crypto_wallets() -> dict[str, str]:
 async def save_crypto_wallets(wallets: dict[str, str]) -> None:
     records = [{"key": f"wallet_{k}", "value": str(v or "").strip()} for k, v in wallets.items()]
     await run_db(lambda: supabase.table("app_settings").upsert(records, on_conflict="key").execute())
+
+
+async def downgrade_expired_subscriptions(bot=None) -> int:
+    """Downgrade users whose paid subscription has expired back to 'free'."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        expired = await run_db(
+            lambda: supabase.table("users")
+            .select("id, telegram_id, subscription_plan, subscription_expires_at")
+            .neq("subscription_plan", "free")
+            .lt("subscription_expires_at", now_iso)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return 0
+
+    count = 0
+    for u in expired:
+        try:
+            await run_db(
+                lambda uid=u["id"]: supabase.table("users")
+                .update({"subscription_plan": "free", "subscription_expires_at": None})
+                .eq("id", uid)
+                .execute()
+            )
+            count += 1
+            if bot and u.get("telegram_id"):
+                try:
+                    await bot.send_message(
+                        u["telegram_id"],
+                        f"⏳ <b>Термін вашої підписки {str(u.get('subscription_plan', '')).upper()} завершився.</b>\n"
+                        "Акаунт автоматично переведено на базовий тариф <b>Free</b>.\n"
+                        "Поновити підписку: /subscribe",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return count

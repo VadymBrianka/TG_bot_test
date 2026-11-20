@@ -4,7 +4,8 @@ from aiogram.types import LabeledPrice, InlineKeyboardMarkup, InlineKeyboardButt
 
 from config import ADMIN_ID
 from db import supabase, run_db
-from services.subscriptions import PLANS, get_user_subscription, get_crypto_wallets
+from services.subscriptions import PLANS, get_user_subscription, get_crypto_wallets, activate_subscription
+from services.blockchain_verify import verify_crypto_payment
 
 
 async def handle_get_plans(request: web.Request):
@@ -85,6 +86,7 @@ async def handle_create_crypto_request(request: web.Request):
 
     plan = str(body.get("plan", "")).lower()
     period = str(body.get("period", "month")).lower()
+    network_key = str(body.get("network_key", "USDT_TRC20")).strip()
     currency = str(body.get("currency", "USDT")).strip().upper()
     tx_hash = str(body.get("tx_hash", "")).strip()
 
@@ -93,7 +95,34 @@ async def handle_create_crypto_request(request: web.Request):
     if not tx_hash:
         return web.json_response({"error": "Вкажіть TX Hash або деталі переказу"}, status=400)
 
+    # Prevent TX Hash replay
+    try:
+        dup = await run_db(
+            lambda: supabase.table("subscription_payments")
+            .select("id")
+            .eq("tx_hash", tx_hash[:250])
+            .in_("status", ["approved", "paid"])
+            .limit(1)
+            .execute()
+            .data
+        )
+        if dup:
+            return web.json_response({"error": "Цей TX Hash уже було використано раніше."}, status=400)
+    except Exception:
+        pass
+
     amount = float(PLANS[plan][f"usd_{period}"])
+    wallets = await get_crypto_wallets()
+    expected_wallet = wallets.get(network_key, "")
+
+    verified, verify_msg = await verify_crypto_payment(
+        network_key=network_key,
+        tx_hash=tx_hash,
+        expected_wallet=expected_wallet,
+        expected_usd=amount,
+    )
+
+    status_val = "approved" if verified else "pending"
 
     try:
         res = await run_db(
@@ -108,7 +137,7 @@ async def handle_create_crypto_request(request: web.Request):
                     "currency": currency,
                     "amount": amount,
                     "tx_hash": tx_hash[:250],
-                    "status": "pending",
+                    "status": status_val,
                 }
             )
             .execute()
@@ -116,6 +145,27 @@ async def handle_create_crypto_request(request: web.Request):
         pay_row = res.data[0]
     except Exception as e:
         return web.json_response({"error": f"Помилка збереження заявки (перевірте migrations.sql): {e}"}, status=400)
+
+    if verified:
+        new_exp = await activate_subscription(user_uuid, plan, period)
+        if bot:
+            try:
+                await bot.send_message(
+                    tg_id,
+                    f"🎉 <b>Оплату автоматично підтверджено в блокчейні!</b>\n"
+                    f"Активовано тариф <b>{plan.upper()}</b> до <b>{new_exp[:10]}</b>.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        return web.json_response(
+            {
+                "status": "approved",
+                "expires_at": new_exp,
+                "message": f"Оплату підтверджено автоматично ({verify_msg})!",
+                "payment": pay_row,
+            }
+        )
 
     if bot:
         kb = InlineKeyboardMarkup(
@@ -129,15 +179,16 @@ async def handle_create_crypto_request(request: web.Request):
         try:
             await bot.send_message(
                 ADMIN_ID,
-                f"🪙 <b>Нова крипто-оплата підписки!</b>\n\n"
+                f"🪙 <b>Нова крипто-оплата підписки (очікує перевірки)</b>\n\n"
                 f"👤 Користувач: <code>{tg_id}</code>\n"
                 f"💎 Тариф: <b>{plan.upper()} ({period})</b>\n"
-                f"💵 Сума: <b>{amount} {currency}</b>\n"
-                f"🔗 TX / Коментар: <code>{tx_hash}</code>",
+                f"💵 Сума: <b>{amount} {currency} ({network_key})</b>\n"
+                f"🔗 TX: <code>{tx_hash}</code>\n"
+                f"ℹ️ Статус автоперевірки: <i>{verify_msg}</i>",
                 reply_markup=kb,
                 parse_mode="HTML",
             )
         except Exception:
             pass
 
-    return web.json_response({"status": "pending", "payment": pay_row})
+    return web.json_response({"status": "pending", "message": verify_msg, "payment": pay_row})

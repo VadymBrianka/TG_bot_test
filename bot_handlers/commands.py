@@ -34,6 +34,7 @@ ADMIN_EXTRA_COMMANDS = [
     BotCommand(command="admin", description="🛡️ Панель адміністратора"),
     BotCommand(command="broadcast", description="📢 Розсилка всім користувачам"),
     BotCommand(command="setrole", description="👤 Змінити роль користувача"),
+    BotCommand(command="givesub", description="💎 Видати підписку: /givesub ID pro 30"),
 ]
 
 

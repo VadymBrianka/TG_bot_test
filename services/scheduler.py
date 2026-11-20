@@ -7,6 +7,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from db import supabase, run_db, get_exchange_rates
 from services.nbu import update_rates_from_nbu
 from services.market_quotes import get_realtime_price
+from services.subscriptions import downgrade_expired_subscriptions
 
 
 async def _check_price_alerts(bot: Bot) -> None:
@@ -234,6 +235,7 @@ async def start_scheduler(bot: Bot) -> None:
                 last_nbu_ts = now_mono
 
             await _check_price_alerts(bot)
+            await downgrade_expired_subscriptions(bot)
 
             today = datetime.now(timezone.utc).date()
             if last_daily_date != today:

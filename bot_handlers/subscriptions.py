@@ -171,3 +171,77 @@ async def cb_review_crypto_sub(callback: CallbackQuery):
         except Exception:
             pass
         await callback.answer("Відхилено")
+
+
+@router.callback_query(F.data.startswith("giveaway_join:"))
+async def cb_giveaway_join(callback: CallbackQuery):
+    if not callback.from_user:
+        return
+    gw_id = callback.data.split(":", 1)[1]
+    tg_id = callback.from_user.id
+
+    rows = await run_db(
+        lambda: supabase.table("giveaways").select("*").eq("id", gw_id).limit(1).execute().data
+    )
+    if not rows:
+        await callback.answer("Розіграш не знайдено", show_alert=True)
+        return
+    gw = rows[0]
+    if gw.get("status") != "active":
+        await callback.answer("Цей розіграш уже завершено!", show_alert=True)
+        return
+
+    participants: list[int] = list(gw.get("participants") or [])
+    if tg_id in participants:
+        await callback.answer("Ви вже берете участь у цьому розіграші! 🎁", show_alert=True)
+        return
+
+    participants.append(tg_id)
+    await run_db(
+        lambda: supabase.table("giveaways").update({"participants": participants}).eq("id", gw_id).execute()
+    )
+    await callback.answer(f"Ви зареєстровані! Учасників: {len(participants)} 🎉", show_alert=True)
+
+
+@router.message(Command("givesub"))
+async def cmd_givesub(message: Message):
+    if not message.from_user or not await is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 3 or not parts[1].isdigit() or parts[2].lower() not in ("free", "pro", "vip"):
+        await message.reply("Формат: <code>/givesub 123456789 pro 30</code>", parse_mode="HTML")
+        return
+
+    target_tg = int(parts[1])
+    plan = parts[2].lower()
+    days = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 30
+
+    rows = await run_db(
+        lambda: supabase.table("users").select("id").eq("telegram_id", target_tg).limit(1).execute().data
+    )
+    if not rows:
+        await message.reply("Користувача не знайдено.")
+        return
+
+    if plan == "free":
+        await run_db(
+            lambda: supabase.table("users")
+            .update({"subscription_plan": "free", "subscription_expires_at": None})
+            .eq("id", rows[0]["id"])
+            .execute()
+        )
+        await message.reply(f"✅ Користувачу <code>{target_tg}</code> встановлено тариф <b>FREE</b>.", parse_mode="HTML")
+    else:
+        new_exp = await activate_subscription(rows[0]["id"], plan, custom_days=days)
+        await message.reply(
+            f"✅ Користувачу <code>{target_tg}</code> видано <b>{plan.upper()}</b> на <b>{days} дн.</b> (до {new_exp[:10]}).",
+            parse_mode="HTML",
+        )
+        try:
+            await message.bot.send_message(
+                target_tg,
+                f"🎁 <b>Адміністратор видав вам підписку {plan.upper()} на {days} дн.!</b>\nДіє до {new_exp[:10]}.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass

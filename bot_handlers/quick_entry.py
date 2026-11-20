@@ -264,3 +264,72 @@ async def handle_receipt_photo(message: Message):
         await status_msg.edit_text(f"⚠️ {ve}")
     except Exception as e:
         await status_msg.edit_text(f"❌ Не вдалося розпізнати чек: {e}")
+
+
+@router.message(F.document)
+async def handle_receipt_document(message: Message):
+    if not message.from_user or not message.document:
+        return
+    mime = (message.document.mime_type or "").lower()
+    if not (mime.startswith("image/") or mime == "application/pdf"):
+        return
+
+    sub = await get_user_subscription(message.from_user.id)
+    if not has_plan(sub["plan"], "pro"):
+        await message.reply(
+            "🔒 <b>ШІ-сканування чеків/накладних доступне на тарифі Pro або VIP.</b>\n"
+            "Натисніть /subscribe або відкрийте вкладку <b>💎 Підписка</b> у Mini App.",
+            parse_mode="HTML",
+        )
+        return
+
+    user_uuid = await get_user_uuid_by_tg_id(message.from_user.id)
+    if not user_uuid:
+        await message.answer("Спочатку натисніть /start")
+        return
+
+    status_msg = await message.reply("🤖 Аналізую документ через ШІ...")
+    try:
+        buf = io.BytesIO()
+        await message.bot.download(message.document, destination=buf)
+        parsed = await parse_receipt_bytes(buf.getvalue(), mime_type=mime)
+
+        raw_amount = float(parsed["total_amount"])
+        explicit_curr = parsed.get("currency") or "UAH"
+        acc, final_amt, final_curr, suffix = await _pick_account_and_amount(user_uuid, raw_amount, explicit_curr)
+        if not acc:
+            await status_msg.edit_text("❌ У вас немає жодного рахунку. Створіть рахунок у Mini App.")
+            return
+
+        cat_id, cat_label = await match_category_id(parsed.get("category_hint", ""))
+        merchant = parsed.get("merchant") or "Документ"
+        items_summary = parsed.get("items_summary") or ""
+        note = f"🧾 {merchant}" + (f" ({items_summary})" if items_summary else "") + suffix
+
+        tx = await create_transaction_atomic(
+            user_uuid=user_uuid,
+            account_id=acc["id"],
+            to_account_id=None,
+            category_id=cat_id,
+            amount=final_amt,
+            target_amount=None,
+            tx_type="expense",
+            note=note[:450],
+        )
+        tx_id = tx.get("id", "")
+        kb = _tx_actions_keyboard(tx_id) if tx_id else None
+        await status_msg.edit_text(
+            f"🧾 <b>Документ розпізнано та записано!</b>\n"
+            f"🔴 Сума: <b>-{final_amt:,.2f} {final_curr}</b>\n"
+            f"🏪 Заклад: <b>{merchant}</b>\n"
+            f"💳 Рахунок: <i>{acc['name']}</i> | {cat_label}\n"
+            + (f"🛒 Позиції: <i>{items_summary}</i>" if items_summary else ""),
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        if cat_id:
+            await check_budget_threshold(message.bot, user_uuid, message.from_user.id, cat_id)
+    except ValueError as ve:
+        await status_msg.edit_text(f"⚠️ {ve}")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Не вдалося розпізнати документ: {e}")

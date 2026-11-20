@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from datetime import datetime, timedelta, timezone
 from aiohttp import web
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
@@ -75,6 +76,19 @@ async def handle_admin_overview(request: web.Request):
         except Exception:
             pending_payments = []
 
+        try:
+            giveaways = (
+                supabase.table("giveaways")
+                .select("*")
+                .order("created_at", desc=True)
+                .limit(10)
+                .execute()
+                .data
+                or []
+            )
+        except Exception:
+            giveaways = []
+
         return {
             "stats": {
                 "users_count": users.count if users.count is not None else len(users.data or []),
@@ -105,6 +119,7 @@ async def handle_admin_overview(request: web.Request):
             ],
             "broadcast_logs": b_logs,
             "pending_payments": pending_payments,
+            "giveaways": giveaways,
         }
 
     data = await run_db(_load)
@@ -325,6 +340,8 @@ async def handle_admin_set_subscription(request: web.Request):
 
     plan = str(body.get("plan", "free")).lower()
     period = str(body.get("period", "month")).lower()
+    days_raw = body.get("days")
+    custom_days = int(days_raw) if days_raw and int(days_raw) > 0 else None
     if plan not in ("free", "pro", "vip"):
         return web.json_response({"error": "Тариф має бути free, pro або vip"}, status=400)
 
@@ -337,7 +354,7 @@ async def handle_admin_set_subscription(request: web.Request):
                 .execute()
             )
             return web.json_response({"status": "updated", "plan": "free"})
-        new_exp = await activate_subscription(target_user_id, plan, period)
+        new_exp = await activate_subscription(target_user_id, plan, period, custom_days=custom_days)
         return web.json_response({"status": "updated", "plan": plan, "expires_at": new_exp})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=400)
@@ -415,3 +432,123 @@ async def handle_admin_save_wallets(request: web.Request):
         return web.json_response({"status": "saved"})
     except Exception as e:
         return web.json_response({"error": f"Не вдалося зберегти гаманці (перевірте migrations.sql): {e}"}, status=400)
+
+
+async def handle_admin_create_giveaway(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    title = str(body.get("title", "")).strip() or "Розіграш підписок FinTrack Hub"
+    plan = str(body.get("plan", "pro")).lower()
+    duration_days = max(int(body.get("duration_days", 30)), 1)
+    winners_count = max(int(body.get("winners_count", 1)), 1)
+    broadcast_to_users = bool(body.get("broadcast_to_users", True))
+
+    if plan not in ("pro", "vip"):
+        return web.json_response({"error": "Тариф розіграшу має бути pro або vip"}, status=400)
+
+    try:
+        res = await run_db(
+            lambda: supabase.table("giveaways")
+            .insert(
+                {
+                    "title": title,
+                    "plan": plan,
+                    "duration_days": duration_days,
+                    "winners_count": winners_count,
+                    "participants": [],
+                    "winners": [],
+                    "status": "active",
+                    "created_by": request["tg_id"],
+                }
+            )
+            .execute()
+        )
+        gw = res.data[0]
+    except Exception as e:
+        return web.json_response({"error": f"Помилка створення розіграшу (перевірте migrations.sql): {e}"}, status=400)
+
+    sent = 0
+    bot = request.app.get("bot")
+    if bot and broadcast_to_users:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🎁 Взяти участь", callback_data=f"giveaway_join:{gw['id']}")]
+            ]
+        )
+        users = await run_db(
+            lambda: supabase.table("users").select("telegram_id, is_banned").execute().data or []
+        )
+        msg_text = (
+            f"🎉 <b>{title}</b>\n\n"
+            f"🎁 Приз: підписка <b>{plan.upper()}</b> на <b>{duration_days} дн.</b>\n"
+            f"🏆 Переможців: <b>{winners_count}</b>\n\n"
+            f"Натисніть кнопку нижче, щоб взяти участь!"
+        )
+        for u in users:
+            if u.get("telegram_id") and not u.get("is_banned"):
+                try:
+                    await bot.send_message(u["telegram_id"], msg_text, reply_markup=kb, parse_mode="HTML")
+                    sent += 1
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    pass
+
+    return web.json_response({"status": "created", "giveaway": gw, "notified": sent})
+
+
+async def handle_admin_draw_giveaway(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+
+    gw_id = request.match_info.get("id")
+    rows = await run_db(
+        lambda: supabase.table("giveaways").select("*").eq("id", gw_id).limit(1).execute().data
+    )
+    if not rows:
+        return web.json_response({"error": "Розіграш не знайдено"}, status=404)
+    gw = rows[0]
+    if gw.get("status") == "finished":
+        return web.json_response({"error": "Розіграш уже завершено"}, status=400)
+
+    participants: list[int] = list({int(x) for x in (gw.get("participants") or [])})
+    if not participants:
+        return web.json_response({"error": "Ще немає жодного учасника"}, status=400)
+
+    k = min(int(gw.get("winners_count") or 1), len(participants))
+    winners = random.sample(participants, k)
+    plan = gw["plan"]
+    days = int(gw["duration_days"])
+
+    bot = request.app.get("bot")
+    for w_tg_id in winners:
+        u_rows = await run_db(
+            lambda tid=w_tg_id: supabase.table("users").select("id").eq("telegram_id", tid).limit(1).execute().data
+        )
+        if u_rows:
+            new_exp = await activate_subscription(u_rows[0]["id"], plan, custom_days=days)
+            if bot:
+                try:
+                    await bot.send_message(
+                        w_tg_id,
+                        f"🏆 <b>Вітаємо! Ви перемогли в розіграші «{gw['title']}»!</b>\n\n"
+                        f"Вам нараховано підписку <b>{plan.upper()}</b> на <b>{days} дн.</b> (до {new_exp[:10]})! 🎉",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+
+    await run_db(
+        lambda: supabase.table("giveaways")
+        .update({"winners": winners, "status": "finished"})
+        .eq("id", gw_id)
+        .execute()
+    )
+    return web.json_response({"status": "finished", "winners": winners})
