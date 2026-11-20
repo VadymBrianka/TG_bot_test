@@ -52,6 +52,50 @@ CREATE TABLE IF NOT EXISTS giveaways (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- VIP Crypto Trading Bot: user trading balances (Demo + Real) & optional Binance API keys
+CREATE TABLE IF NOT EXISTS trading_wallets (
+  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  demo_usdt NUMERIC(18, 4) NOT NULL DEFAULT 10000.0,
+  real_usdt NUMERIC(18, 4) NOT NULL DEFAULT 0.0,
+  binance_api_key TEXT DEFAULT '',
+  binance_api_secret TEXT DEFAULT '',
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- VIP Crypto Trading Bot configurations
+CREATE TABLE IF NOT EXISTS trading_bots (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL DEFAULT 'demo' CHECK (mode IN ('demo', 'real')),
+  symbol TEXT NOT NULL DEFAULT 'BTCUSDT',
+  strategy TEXT NOT NULL DEFAULT 'tp_sl' CHECK (strategy IN ('tp_sl', 'dca', 'momentum')),
+  order_usdt NUMERIC(14, 2) NOT NULL CHECK (order_usdt > 0),
+  take_profit_pct NUMERIC(6, 2) NOT NULL DEFAULT 3.0,
+  stop_loss_pct NUMERIC(6, 2) NOT NULL DEFAULT 2.0,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  position_qty NUMERIC(18, 8) NOT NULL DEFAULT 0,
+  entry_price NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  realized_pnl NUMERIC(18, 4) NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- VIP Crypto Trading Bot executed orders history
+CREATE TABLE IF NOT EXISTS trading_orders (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  bot_id UUID REFERENCES trading_bots(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  mode TEXT NOT NULL DEFAULT 'demo',
+  symbol TEXT NOT NULL,
+  side TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+  price NUMERIC(18, 4) NOT NULL,
+  quantity NUMERIC(18, 8) NOT NULL,
+  usdt_amount NUMERIC(18, 4) NOT NULL,
+  pnl NUMERIC(18, 4) DEFAULT 0,
+  reason TEXT DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Broadcast history table for admin panel
 CREATE TABLE IF NOT EXISTS broadcast_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
