@@ -5,13 +5,15 @@ from typing import Any
 import aiohttp
 
 from config import GEMINI_API_KEY
+from db import supabase, run_db
 from services.subscriptions import PLANS
 
 MODELS_FALLBACK = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.8-flash"]
 
 RECENT_UPDATES = [
-    "Великий редизайн UI/UX Mini App: сучасна фінтех-палітра, нижня панель навігації (Bottom Tab Bar) із центральною кнопкою «+» для швидкого запису з будь-якого екрана, меню «Ще», акордеони в Налаштуваннях та плавне Skeleton-завантаження.",
-    "Режим приватності (👁️) на головному екрані: приховує баланси рахунків, Net Worth та суми транзакцій одним дотиком.",
+    "Великий редизайн UI/UX Mini App: сучасна фінтех-палітра, нижня панель навігації (Bottom Tab Bar) із центральною кнопкою «+» для швидкого запису з будь-якого екрана, меню «Ще», акордеони в Налаштуваннях, автоматичне приховування нижнього меню при відкритій клавіатурі та плавне Skeleton-завантаження.",
+    "Безпечне та зручне редагування записів: закриття вікна редагування натисканням поза ним або кнопкою ✕ зверху, розділені кнопки «Зберегти зміни» та 2-крокове підтвердження видалення.",
+    "Режим приватності (👁️) на головному екрані: приховує баланси рахунків, Net Worth, суми в структурі капіталу та транзакціях одним дотиком.",
     "Головний екран: горизонтальна карусель рахунків та групування транзакцій по днях («Сьогодні», «Вчора») із підсумком витрат за день.",
     "Кастомні категорії та правила автокатегоризації (Pro+): створюйте власні категорії та правила (напр. Glovo -> Доставка їжі), щоб бот визначав категорію автоматично.",
     "Пошук, фільтрація транзакцій та #теги (Free/Pro): фільтр за рахунком, нотаткою або #тегами (напр. #відпустка) з миттєвим підрахунком суми.",
@@ -28,18 +30,44 @@ RECENT_UPDATES = [
 ]
 
 
-def _build_product_context() -> str:
+async def _get_sent_broadcasts_summary() -> str:
+    try:
+        rows = await run_db(
+            lambda: supabase.table("broadcast_logs")
+            .select("message_text, target_filter, created_at")
+            .order("created_at", desc=True)
+            .limit(8)
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            return "Раніше розсилки ще не надсилалися."
+        lines = []
+        for r in rows:
+            dt = str(r.get("created_at") or "")[:10]
+            txt = str(r.get("message_text") or "").replace("\n", " ")[:180]
+            lines.append(f"- [{dt}] ({r.get('target_filter', 'all')}): {txt}")
+        return "\n".join(lines)
+    except Exception:
+        return "Історія розсилок недоступна."
+
+
+async def _build_product_context() -> str:
     plans_lines = []
     for key in ("free", "pro", "vip"):
         p = PLANS[key]
         feats = "; ".join(p["features"])
         plans_lines.append(f"- {p['name']} (${p['usd_month']}/міс або {p['stars_month']} Stars): {feats}")
     updates_lines = "\n".join(f"- {u}" for u in RECENT_UPDATES)
+    sent_history = await _get_sent_broadcasts_summary()
     return (
         "Актуальні тарифи та функції FinTrack Hub:\n"
         + "\n".join(plans_lines)
-        + "\n\nОстанні нововведення в боті та Mini App:\n"
+        + "\n\nУсі останні нововведення в боті, бекенді та UI/UX дизайні:\n"
         + updates_lines
+        + "\n\nОстанні вже надіслані розсилки (якщо адміністратор просить розказати про нові/ще не анонсовані зміни — НЕ повторюй те, що вже було в цих розсилках, а обери те, про що ще не писали):\n"
+        + sent_history
     )
 
 
@@ -47,7 +75,7 @@ async def generate_broadcast_draft(topic: str, tone: str = "дружній") -> 
     if not GEMINI_API_KEY:
         raise ValueError("ШІ-генератор не налаштовано: додайте GEMINI_API_KEY у змінні середовища сервера.")
 
-    product_context = _build_product_context()
+    product_context = await _build_product_context()
     prompt = f"""Ти — копірайтер і маркетинг-агент фінансового Telegram-бота FinTrack Hub.
 Напиши коротку, яскраву та корисну статтю/оголошення для розсилки користувачам у Telegram українською мовою.
 
