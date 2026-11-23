@@ -1,7 +1,7 @@
 import csv
 import io
 from datetime import datetime, timedelta, timezone
-from db import supabase, run_db
+from db import supabase, run_db, sanitize_csv_cell
 
 
 async def build_transactions_csv(user_uuid: str, days: int = 365) -> str:
@@ -36,9 +36,9 @@ async def build_transactions_csv(user_uuid: str, days: int = 365) -> str:
                 t.get("type", ""),
                 t.get("amount", 0),
                 acc.get("currency", "UAH"),
-                acc.get("name", ""),
-                cat_map.get(t.get("category_id"), "Інше"),
-                t.get("note", ""),
+                sanitize_csv_cell(acc.get("name", "")),
+                sanitize_csv_cell(cat_map.get(t.get("category_id"), "Інше")),
+                sanitize_csv_cell(t.get("note", "")),
             ]
         )
     return buf.getvalue()

@@ -1,6 +1,6 @@
 import logging
 import aiohttp
-from db import supabase, run_db
+from db import supabase, run_db, invalidate_rates_cache
 
 
 async def update_rates_from_nbu() -> None:
@@ -19,6 +19,7 @@ async def update_rates_from_nbu() -> None:
                     await run_db(
                         lambda: supabase.table("exchange_rates").upsert(records, on_conflict="currency").execute()
                     )
+                    invalidate_rates_cache()
                     logging.info(f"Оновлено {len(records)} курсів валют НБУ.")
     except Exception as e:
         logging.error(f"Помилка оновлення курсів НБУ: {e}")

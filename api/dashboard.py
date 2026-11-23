@@ -1,7 +1,9 @@
+import asyncio
 import logging
 from aiohttp import web
-from db import supabase, run_db, get_exchange_rates, get_user_role
-from services.subscriptions import get_user_subscription
+from config import ADMIN_ID
+from db import supabase, run_db, get_exchange_rates
+from services.subscriptions import PLAN_ORDER
 
 
 async def handle_health(request: web.Request):
@@ -13,7 +15,7 @@ async def handle_health(request: web.Request):
         )
     except Exception as e:
         logging.error(f"Healthcheck DB error: {e}")
-        return web.json_response({"status": "degraded", "db": "error", "detail": str(e)}, status=500)
+        return web.json_response({"status": "degraded", "db": "error"}, status=500)
 
 
 async def handle_get_currencies(request: web.Request):
@@ -30,13 +32,12 @@ async def handle_get_currencies(request: web.Request):
 async def handle_dashboard_summary(request: web.Request):
     try:
         user_uuid: str = request["user_uuid"]
+        tg_id: int = request["tg_id"]
+        user_row = request.get("user_row") or {}
 
-        def _load():
-            accs = supabase.table("accounts").select("*").eq("user_id", user_uuid).order("created_at").execute().data or []
-            invs = supabase.table("investments").select("*").eq("user_id", user_uuid).order("updated_at", desc=True).execute().data or []
-            goals = supabase.table("goals").select("*").eq("user_id", user_uuid).order("created_at").execute().data or []
+        def _load_cats():
             try:
-                cats = (
+                return (
                     supabase.table("categories")
                     .select("*")
                     .or_(f"user_id.is.null,user_id.eq.{user_uuid}")
@@ -46,10 +47,15 @@ async def handle_dashboard_summary(request: web.Request):
                     or []
                 )
             except Exception:
-                cats = supabase.table("categories").select("*").order("name").execute().data or []
+                return supabase.table("categories").select("*").order("name").execute().data or []
 
-            raw_txs = (
-                supabase.table("transactions")
+        accs, invs, goals, cats, raw_txs, rates = await asyncio.gather(
+            run_db(lambda: supabase.table("accounts").select("*").eq("user_id", user_uuid).order("created_at").execute().data or []),
+            run_db(lambda: supabase.table("investments").select("*").eq("user_id", user_uuid).order("updated_at", desc=True).execute().data or []),
+            run_db(lambda: supabase.table("goals").select("*").eq("user_id", user_uuid).order("created_at").execute().data or []),
+            run_db(_load_cats),
+            run_db(
+                lambda: supabase.table("transactions")
                 .select("*, categories(name, icon)")
                 .eq("user_id", user_uuid)
                 .order("transaction_date", desc=True)
@@ -57,12 +63,9 @@ async def handle_dashboard_summary(request: web.Request):
                 .execute()
                 .data
                 or []
-            )
-            user_row = supabase.table("users").select("*").eq("id", user_uuid).limit(1).execute().data
-            return accs, invs, goals, cats, raw_txs, (user_row[0] if user_row else {})
-
-        accs, invs, goals, cats, raw_txs, user_row = await run_db(_load)
-        rates = await get_exchange_rates()
+            ),
+            get_exchange_rates(),
+        )
 
         acc_map = {a["id"]: {"name": a["name"], "currency": a["currency"]} for a in accs}
         txs = []
@@ -81,8 +84,23 @@ async def handle_dashboard_summary(request: web.Request):
         total_goals_uah = sum(float(g["current_amount"]) * rates.get(str(g.get("currency", "UAH")).upper(), 1.0) for g in goals)
         net_worth = total_accounts_uah + total_investments_uah + total_goals_uah
 
-        role = await get_user_role(request["tg_id"])
-        subscription = await get_user_subscription(request["tg_id"])
+        role = str(user_row.get("role") or ("admin" if tg_id == ADMIN_ID else "user")).lower()
+        if tg_id == ADMIN_ID or role == "admin":
+            subscription = {"plan": "vip", "expires_at": None, "is_active": True, "is_admin_override": True}
+        else:
+            plan = str(user_row.get("subscription_plan") or "free").lower()
+            if plan not in PLAN_ORDER:
+                plan = "free"
+            exp_raw = user_row.get("subscription_expires_at")
+            if plan != "free" and exp_raw:
+                from datetime import datetime, timezone
+                try:
+                    if datetime.fromisoformat(str(exp_raw).replace("Z", "+00:00")) < datetime.now(timezone.utc):
+                        plan = "free"
+                        exp_raw = None
+                except Exception:
+                    pass
+            subscription = {"plan": plan, "expires_at": exp_raw, "is_active": True}
 
         return web.json_response(
             {

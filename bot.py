@@ -122,7 +122,7 @@ dp.include_router(quick_entry.router)
 
 
 def create_web_app() -> web.Application:
-    app = web.Application(middlewares=[cors_middleware, auth_middleware])
+    app = web.Application(middlewares=[cors_middleware, auth_middleware], client_max_size=12 * 1024 * 1024)
     app["bot"] = bot
 
     # Health & Public

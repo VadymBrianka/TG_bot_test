@@ -9,7 +9,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 
 from config import MINIAPP_URL, GEMINI_API_KEY
-from db import supabase, run_db, is_admin
+from db import supabase, run_db, is_admin, sanitize_csv_cell
 from services.nbu import update_rates_from_nbu
 from services.broadcast_ai import generate_broadcast_draft
 from services.subscriptions import (
@@ -863,8 +863,8 @@ async def handle_admin_export_users(request: web.Request):
     for r in rows:
         writer.writerow([
             r.get("telegram_id", ""),
-            r.get("username", ""),
-            r.get("first_name", ""),
+            sanitize_csv_cell(r.get("username", "")),
+            sanitize_csv_cell(r.get("first_name", "")),
             r.get("role", "user"),
             r.get("is_banned", False),
             r.get("base_currency", "UAH"),

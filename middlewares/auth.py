@@ -1,3 +1,4 @@
+from collections import defaultdict, deque
 import hashlib
 import hmac
 import json
@@ -8,6 +9,25 @@ from aiohttp import web
 
 from config import BOT_TOKEN, ALLOWED_ORIGINS, PRIMARY_ORIGIN, ALLOW_INSECURE_TG_ID
 from db import get_user_by_tg_id
+
+_RATE_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
+_AI_PATHS = {
+    "/api/v1/receipts/parse",
+    "/api/v1/analytics/chat",
+    "/api/v1/analytics/advice",
+    "/api/v1/admin/broadcast/generate",
+}
+
+
+def _check_rate_limit(key: str, max_requests: int, window_sec: float = 60.0) -> bool:
+    now = time.monotonic()
+    q = _RATE_BUCKETS[key]
+    while q and (now - q[0]) > window_sec:
+        q.popleft()
+    if len(q) >= max_requests:
+        return False
+    q.append(now)
+    return True
 
 PUBLIC_PATHS = {
     "/",
@@ -69,6 +89,10 @@ async def cors_middleware(request: web.Request, handler):
     response.headers["Access-Control-Allow-Headers"] = (
         "Content-Type, Authorization, X-Telegram-Init-Data, ngrok-skip-browser-warning"
     )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
@@ -107,6 +131,12 @@ async def auth_middleware(request: web.Request, handler):
     if user.get("is_banned"):
         return web.json_response({"error": "Ваш акаунт заблоковано адміністратором."}, status=403)
 
+    if not _check_rate_limit(f"api:{tg_id}", max_requests=100, window_sec=60.0):
+        return web.json_response({"error": "Занадто багато запитів. Спробуйте за хвилину."}, status=429)
+    if request.path in _AI_PATHS and not _check_rate_limit(f"ai:{tg_id}", max_requests=12, window_sec=60.0):
+        return web.json_response({"error": "Ліміт ШІ-запитів (12/хв). Зачекайте трохи."}, status=429)
+
     request["tg_id"] = tg_id
     request["user_uuid"] = user["id"]
+    request["user_row"] = user
     return await handler(request)

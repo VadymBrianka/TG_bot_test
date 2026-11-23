@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar
 from supabase import create_client, Client
@@ -47,7 +48,31 @@ async def get_user_uuid_by_tg_id(tg_id: int) -> str | None:
     return await run_db(_q)
 
 
+_RATES_CACHE: dict[str, float] | None = None
+_RATES_CACHE_TS: float = 0.0
+_RATES_TTL_SECONDS: float = 300.0
+
+
+def invalidate_rates_cache() -> None:
+    global _RATES_CACHE, _RATES_CACHE_TS
+    _RATES_CACHE = None
+    _RATES_CACHE_TS = 0.0
+
+
+def sanitize_csv_cell(val: Any) -> str:
+    """Prevent CSV formula injection in Excel/LibreOffice."""
+    s = "" if val is None else str(val)
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + s
+    return s
+
+
 async def get_exchange_rates() -> dict[str, float]:
+    global _RATES_CACHE, _RATES_CACHE_TS
+    now = time.monotonic()
+    if _RATES_CACHE is not None and (now - _RATES_CACHE_TS) < _RATES_TTL_SECONDS:
+        return dict(_RATES_CACHE)
+
     def _q():
         res = supabase.table("exchange_rates").select("currency, rate_to_base").execute()
         rates = {
@@ -59,7 +84,11 @@ async def get_exchange_rates() -> dict[str, float]:
         if "USD" in rates:
             rates["USDT"] = rates["USD"]
         return rates
-    return await run_db(_q)
+
+    rates = await run_db(_q)
+    _RATES_CACHE = dict(rates)
+    _RATES_CACHE_TS = now
+    return rates
 
 
 async def get_default_account(user_uuid: str) -> dict[str, Any] | None:
