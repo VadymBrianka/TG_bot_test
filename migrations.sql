@@ -268,3 +268,69 @@ BEGIN
   VALUES (p_user_id, p_account_id, ROUND(p_amount_acc, 2), ROUND(p_amount_goal, 2), 'transfer', p_note);
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- 8. User activity tracking & active promo code
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ DEFAULT NOW(),
+  ADD COLUMN IF NOT EXISTS active_promo_code TEXT DEFAULT NULL;
+
+-- 9. Transaction tags column
+ALTER TABLE transactions
+  ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT '{}';
+
+-- 10. Auto-categorization rules (Pro+)
+CREATE TABLE IF NOT EXISTS category_rules (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  keyword TEXT NOT NULL,
+  category_id UUID NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (user_id, keyword)
+);
+
+-- 11. Paid service subscriptions tracker (Pro+)
+CREATE TABLE IF NOT EXISTS service_subscriptions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  amount NUMERIC(14, 2) NOT NULL CHECK (amount > 0),
+  currency TEXT NOT NULL DEFAULT 'UAH',
+  billing_cycle TEXT NOT NULL DEFAULT 'monthly' CHECK (billing_cycle IN ('monthly', 'yearly')),
+  next_billing_date DATE NOT NULL,
+  reminder_days INT NOT NULL DEFAULT 2,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  last_reminded_date DATE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 12. Promo codes (trial & discount)
+CREATE TABLE IF NOT EXISTS promo_codes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  code TEXT UNIQUE NOT NULL,
+  promo_type TEXT NOT NULL CHECK (promo_type IN ('trial', 'discount')),
+  plan TEXT NOT NULL DEFAULT 'pro' CHECK (plan IN ('pro', 'vip')),
+  duration_days INT NOT NULL DEFAULT 14,
+  discount_percent INT NOT NULL DEFAULT 0,
+  max_uses INT NOT NULL DEFAULT 100,
+  used_count INT NOT NULL DEFAULT 0,
+  expires_at TIMESTAMPTZ,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS promo_redemptions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  promo_id UUID NOT NULL REFERENCES promo_codes(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  redeemed_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (promo_id, user_id)
+);
+
+-- 13. Feature usage & funnel analytics events
+CREATE TABLE IF NOT EXISTS analytics_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  event_name TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+

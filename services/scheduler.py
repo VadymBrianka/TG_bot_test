@@ -350,6 +350,74 @@ async def _run_monthly_digest(bot: Bot) -> None:
         logging.debug(f"Monthly digest skipped: {e}")
 
 
+async def _run_service_subscription_reminders(bot: Bot) -> None:
+    """Remind Pro+ users 2 days before paid service billing dates and advance past dates."""
+    try:
+        today = datetime.now(timezone.utc).date()
+        today_iso = today.isoformat()
+        svcs = await run_db(
+            lambda: supabase.table("service_subscriptions")
+            .select("*")
+            .eq("is_active", True)
+            .execute()
+            .data
+            or []
+        )
+        if not svcs:
+            return
+        users_map = {
+            u["id"]: u
+            for u in (await run_db(lambda: supabase.table("users").select("id, telegram_id, is_banned").execute().data or []))
+        }
+        for s in svcs:
+            u = users_map.get(s.get("user_id"))
+            if not u or u.get("is_banned") or not u.get("telegram_id"):
+                continue
+            try:
+                due_dt = datetime.fromisoformat(str(s["next_billing_date"])[:10]).date()
+            except Exception:
+                continue
+
+            # Advance past-due date to next cycle
+            if due_dt < today:
+                next_dt = due_dt
+                while next_dt < today:
+                    if s.get("billing_cycle") == "yearly":
+                        next_dt = next_dt + timedelta(days=365)
+                    else:
+                        next_dt = next_dt + timedelta(days=30)
+                await run_db(
+                    lambda sid=s["id"], nd=next_dt.isoformat(): supabase.table("service_subscriptions")
+                    .update({"next_billing_date": nd})
+                    .eq("id", sid)
+                    .execute()
+                )
+                due_dt = next_dt
+
+            rem_days = int(s.get("reminder_days") or 2)
+            days_left = (due_dt - today).days
+            if 0 <= days_left <= rem_days and str(s.get("last_reminded_date") or "") != today_iso:
+                when_txt = "сьогодні" if days_left == 0 else ("завтра" if days_left == 1 else f"через {days_left} дн.")
+                try:
+                    await bot.send_message(
+                        u["telegram_id"],
+                        f"🔔 <b>Нагадування про підписку «{s['name']}»</b>\n\n"
+                        f"Списання <b>{float(s['amount']):,.2f} {s.get('currency', 'UAH')}</b> відбудеться <b>{when_txt}</b> ({due_dt.isoformat()}).\n"
+                        f"Якщо сервіс більше не потрібен — не забудьте скасувати його!",
+                        parse_mode="HTML",
+                    )
+                    await run_db(
+                        lambda sid=s["id"]: supabase.table("service_subscriptions")
+                        .update({"last_reminded_date": today_iso})
+                        .eq("id", sid)
+                        .execute()
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        logging.debug(f"Service subscription reminders skipped: {e}")
+
+
 async def start_scheduler(bot: Bot) -> None:
     """Periodic background scheduler for NBU rates (6h), price alerts, pending crypto, and daily/monthly digests."""
     last_nbu_ts = 0.0
@@ -370,6 +438,7 @@ async def start_scheduler(bot: Bot) -> None:
 
             if await _claim_schedule_slot("scheduler_last_daily", today_str):
                 await _run_daily_notifications(bot)
+                await _run_service_subscription_reminders(bot)
 
             if now_utc.day == 1:
                 month_slot = now_utc.strftime("%Y-%m")

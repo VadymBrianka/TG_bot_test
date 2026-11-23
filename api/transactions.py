@@ -1,8 +1,24 @@
 import logging
+import re
 from aiohttp import web
 from db import supabase, run_db, create_transaction_atomic, apply_tx_balance_effect_sync, get_exchange_rates
 from schemas import TransactionCreate, TransactionUpdate, parse_json_body
 from services.budget_alerts import check_budget_threshold
+from api.categories import match_category_rule
+from services.analytics_events import track_event, touch_user_active
+
+TAG_RE = re.compile(r"#([A-Za-zА-Яа-яІіЇїЄєҐґ0-9_]{2,32})")
+
+
+def extract_tags(text: str) -> list[str]:
+    if not text:
+        return []
+    seen = []
+    for m in TAG_RE.findall(text):
+        t = m.lower()
+        if t not in seen:
+            seen.append(t)
+    return seen
 
 
 async def handle_list_transactions(request: web.Request):
@@ -15,6 +31,7 @@ async def handle_list_transactions(request: web.Request):
         category_id = q.get("category_id", "").strip()
         account_id = q.get("account_id", "").strip()
         search = q.get("search", "").strip()
+        tag = q.get("tag", "").strip().lstrip("#").lower()
         date_from = q.get("date_from", "").strip()
         date_to = q.get("date_to", "").strip()
         sort_by = q.get("sort_by", "date_desc").strip()
@@ -38,6 +55,8 @@ async def handle_list_transactions(request: web.Request):
                 stmt = stmt.or_(f"account_id.eq.{account_id},to_account_id.eq.{account_id}")
             if search:
                 stmt = stmt.ilike("note", f"%{search}%")
+            if tag:
+                stmt = stmt.ilike("note", f"%#{tag}%")
             if date_from:
                 stmt = stmt.gte("transaction_date", date_from)
             if date_to:
@@ -57,6 +76,7 @@ async def handle_list_transactions(request: web.Request):
             for t in rows:
                 t["from_acc"] = acc_map.get(t.get("account_id"))
                 t["to_acc"] = acc_map.get(t.get("to_account_id"))
+                t["parsed_tags"] = extract_tags(t.get("note") or "")
             return rows, (res.count if res.count is not None else len(rows))
 
         rows, total = await run_db(_query)
@@ -74,6 +94,8 @@ async def handle_create_transaction(request: web.Request):
     user_uuid: str = request["user_uuid"]
     tg_id: int = request["tg_id"]
     category_id = body.category_id if body.category_id and not body.category_id.startswith("other_") else None
+    if not category_id and body.note and body.type in ("expense", "income"):
+        category_id = await match_category_rule(user_uuid, body.note)
 
     if body.type == "transfer" and (not body.to_account_id or body.to_account_id == body.account_id):
         return web.json_response({"error": "Оберіть два різних рахунки для переказу"}, status=400)
@@ -121,6 +143,8 @@ async def handle_create_transaction(request: web.Request):
             bot = request.app.get("bot")
             if bot:
                 await check_budget_threshold(bot, user_uuid, tg_id, category_id)
+        await touch_user_active(user_uuid)
+        await track_event(user_uuid, f"tx_{body.type}")
         return web.json_response({"status": "success", "transaction": tx})
     except ValueError as ve:
         return web.json_response({"error": str(ve)}, status=400)

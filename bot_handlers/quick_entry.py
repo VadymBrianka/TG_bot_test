@@ -14,7 +14,9 @@ from db import (
 from services.budget_alerts import check_budget_threshold
 from services.receipt_ai import parse_receipt_bytes, match_category_id
 from services.voice_ai import parse_voice_transactions
+from services.finance_chat_ai import answer_finance_question
 from services.subscriptions import get_user_subscription, has_plan
+from api.categories import match_category_rule
 
 router = Router()
 
@@ -54,7 +56,24 @@ def _normalize_currency(raw: str | None) -> str | None:
 
 async def _match_category(user_uuid: str, text: str, tx_type: str) -> tuple[str | None, str]:
     lower = text.lower()
-    cats = await run_db(lambda: supabase.table("categories").select("id, name, icon, type").execute().data or [])
+    try:
+        cats = await run_db(
+            lambda: supabase.table("categories")
+            .select("id, name, icon, type")
+            .or_(f"user_id.is.null,user_id.eq.{user_uuid}")
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        cats = await run_db(lambda: supabase.table("categories").select("id, name, icon, type").execute().data or [])
+
+    rule_cat_id = await match_category_rule(user_uuid, text)
+    if rule_cat_id:
+        matched_cat = next((c for c in cats if c.get("id") == rule_cat_id), None)
+        if matched_cat:
+            return matched_cat["id"], f"{matched_cat.get('icon', '🏷️')} {matched_cat['name']}"
+
     typed_cats = [c for c in cats if c.get("type") == tx_type]
 
     for c in typed_cats:
@@ -370,7 +389,9 @@ async def handle_voice_entry(message: Message):
             )
             if not acc:
                 continue
-            cat_id, cat_label = await match_category_id(it.get("category_hint", ""))
+            cat_id, cat_label = await _match_category(
+                user_uuid, f"{it.get('note', '')} {it.get('category_hint', '')}", it["type"]
+            )
             tx = await create_transaction_atomic(
                 user_uuid=user_uuid,
                 account_id=acc["id"],
@@ -392,3 +413,27 @@ async def handle_voice_entry(message: Message):
         await status_msg.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
     except Exception as e:
         await status_msg.edit_text(f"❌ Помилка розпізнавання голосу: {e}")
+
+
+@router.message(F.text.endswith("?"))
+async def handle_finance_question_text(message: Message):
+    if not message.from_user or not message.text or message.text.startswith("/"):
+        return
+    sub = await get_user_subscription(message.from_user.id)
+    if not has_plan(sub["plan"], "pro"):
+        await message.reply(
+            "🔒 <b>ШІ-чат із фінансами доступний на тарифі Pro або VIP.</b>\nОформити: /subscribe",
+            parse_mode="HTML",
+        )
+        return
+
+    user_uuid = await get_user_uuid_by_tg_id(message.from_user.id)
+    if not user_uuid:
+        return
+
+    wait_msg = await message.reply("🤖 Аналізую ваші дані...")
+    try:
+        ans = await answer_finance_question(user_uuid, message.text.strip())
+        await wait_msg.edit_text(f"🤖 <b>FinTrack AI:</b>\n\n{ans}", parse_mode="HTML")
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ Помилка ШІ-асистента: {e}")

@@ -4,7 +4,14 @@ from aiogram.types import LabeledPrice, InlineKeyboardMarkup, InlineKeyboardButt
 
 from config import ADMIN_ID
 from db import supabase, run_db
-from services.subscriptions import PLANS, get_user_subscription, get_crypto_wallets, activate_subscription
+from services.subscriptions import (
+    get_effective_plans,
+    get_user_subscription,
+    get_crypto_wallets,
+    activate_subscription,
+    get_user_active_promo,
+    redeem_promo_code,
+)
 from services.blockchain_verify import verify_crypto_payment
 
 
@@ -13,6 +20,18 @@ async def handle_get_plans(request: web.Request):
     tg_id: int = request["tg_id"]
     sub = await get_user_subscription(tg_id)
     wallets = await get_crypto_wallets()
+    plans = await get_effective_plans()
+    active_promo = await get_user_active_promo(user_uuid)
+
+    if active_promo and active_promo.get("discount_percent"):
+        pct = min(90, max(1, int(active_promo["discount_percent"])))
+        promo_plan = active_promo.get("plan")
+        for p_key in ("pro", "vip"):
+            if not promo_plan or promo_plan == p_key:
+                plans[p_key]["stars_month"] = max(1, round(plans[p_key]["stars_month"] * (100 - pct) / 100))
+                plans[p_key]["stars_year"] = max(1, round(plans[p_key]["stars_year"] * (100 - pct) / 100))
+                plans[p_key]["usd_month"] = round(max(0.1, plans[p_key]["usd_month"] * (100 - pct) / 100), 2)
+                plans[p_key]["usd_year"] = round(max(0.1, plans[p_key]["usd_year"] * (100 - pct) / 100), 2)
 
     try:
         payments = await run_db(
@@ -30,10 +49,15 @@ async def handle_get_plans(request: web.Request):
 
     return web.json_response(
         {
-            "plans": PLANS,
+            "plans": plans,
             "subscription": sub,
             "wallets": wallets,
             "payments": payments,
+            "active_promo": (
+                {"code": active_promo["code"], "discount_percent": active_promo["discount_percent"], "plan": active_promo.get("plan")}
+                if active_promo
+                else None
+            ),
         }
     )
 
@@ -54,10 +78,16 @@ async def handle_create_stars_invoice(request: web.Request):
     if plan not in ("pro", "vip") or period not in ("month", "year"):
         return web.json_response({"error": "Некоректний тариф або період"}, status=400)
 
-    stars_amount = PLANS[plan][f"stars_{period}"]
+    plans = await get_effective_plans()
+    stars_amount = plans[plan][f"stars_{period}"]
+    active_promo = await get_user_active_promo(user_uuid)
+    if active_promo and active_promo.get("discount_percent") and (not active_promo.get("plan") or active_promo["plan"] == plan):
+        pct = min(90, max(1, int(active_promo["discount_percent"])))
+        stars_amount = max(1, round(stars_amount * (100 - pct) / 100))
+
     period_label = "1 рік (-33%)" if period == "year" else "1 місяць"
-    title = f"FinTrack Hub {PLANS[plan]['name']} ({period_label})"
-    description = ", ".join(PLANS[plan]["features"][:3])
+    title = f"FinTrack Hub {plans[plan]['name']} ({period_label})"
+    description = ", ".join(plans[plan]["features"][:3])
     payload = f"sub:{user_uuid}:{plan}:{period}"
 
     try:
@@ -111,7 +141,12 @@ async def handle_create_crypto_request(request: web.Request):
     except Exception:
         pass
 
-    amount = float(PLANS[plan][f"usd_{period}"])
+    plans = await get_effective_plans()
+    amount = float(plans[plan][f"usd_{period}"])
+    active_promo = await get_user_active_promo(user_uuid)
+    if active_promo and active_promo.get("discount_percent") and (not active_promo.get("plan") or active_promo["plan"] == plan):
+        pct = min(90, max(1, int(active_promo["discount_percent"])))
+        amount = round(max(0.1, amount * (100 - pct) / 100), 2)
     wallets = await get_crypto_wallets()
     expected_wallet = wallets.get(network_key, "")
 
@@ -192,3 +227,20 @@ async def handle_create_crypto_request(request: web.Request):
             pass
 
     return web.json_response({"status": "pending", "message": verify_msg, "payment": pay_row})
+
+
+async def handle_redeem_promo(request: web.Request):
+    user_uuid: str = request["user_uuid"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    code = str(body.get("code") or "").strip()
+    try:
+        res = await redeem_promo_code(user_uuid, code)
+        return web.json_response(res)
+    except ValueError as ve:
+        return web.json_response({"error": str(ve)}, status=400)
+    except Exception as e:
+        return web.json_response({"error": f"Помилка активації промокоду: {e}"}, status=500)

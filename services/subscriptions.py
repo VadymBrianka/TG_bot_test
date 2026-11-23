@@ -1,3 +1,5 @@
+import copy
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -224,3 +226,149 @@ async def downgrade_expired_subscriptions(bot=None) -> int:
         except Exception:
             pass
     return count
+
+
+async def get_effective_plans() -> dict[str, dict[str, Any]]:
+    """Return PLANS merged with dynamic admin-configured prices from app_settings."""
+    plans = copy.deepcopy(PLANS)
+    try:
+        rows = await run_db(
+            lambda: supabase.table("app_settings")
+            .select("value")
+            .eq("key", "subscription_prices")
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if rows and rows[0].get("value"):
+            overrides = json.loads(rows[0]["value"])
+            for p_key in ("pro", "vip"):
+                if isinstance(overrides.get(p_key), dict):
+                    for field in ("stars_month", "stars_year"):
+                        if field in overrides[p_key]:
+                            val = int(overrides[p_key][field])
+                            if val > 0:
+                                plans[p_key][field] = val
+                    for field in ("usd_month", "usd_year"):
+                        if field in overrides[p_key]:
+                            val_f = float(overrides[p_key][field])
+                            if val_f > 0:
+                                plans[p_key][field] = round(val_f, 2)
+    except Exception:
+        pass
+    return plans
+
+
+async def save_subscription_prices(prices: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    clean: dict[str, dict[str, Any]] = {}
+    for p_key in ("pro", "vip"):
+        src = prices.get(p_key) or {}
+        clean[p_key] = {
+            "stars_month": max(1, int(src.get("stars_month", PLANS[p_key]["stars_month"]))),
+            "stars_year": max(1, int(src.get("stars_year", PLANS[p_key]["stars_year"]))),
+            "usd_month": round(max(0.1, float(src.get("usd_month", PLANS[p_key]["usd_month"]))), 2),
+            "usd_year": round(max(0.1, float(src.get("usd_year", PLANS[p_key]["usd_year"]))), 2),
+        }
+    await run_db(
+        lambda: supabase.table("app_settings")
+        .upsert({"key": "subscription_prices", "value": json.dumps(clean)}, on_conflict="key")
+        .execute()
+    )
+    return await get_effective_plans()
+
+
+async def get_user_active_promo(user_uuid: str) -> dict[str, Any] | None:
+    try:
+        u_rows = await run_db(
+            lambda: supabase.table("users")
+            .select("active_promo_code")
+            .eq("id", user_uuid)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        code = (u_rows[0].get("active_promo_code") if u_rows else None) or ""
+        if not code:
+            return None
+        p_rows = await run_db(
+            lambda: supabase.table("promo_codes")
+            .select("*")
+            .eq("code", code)
+            .eq("is_active", True)
+            .eq("promo_type", "discount")
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not p_rows:
+            return None
+        promo = p_rows[0]
+        if promo.get("expires_at"):
+            exp = datetime.fromisoformat(str(promo["expires_at"]).replace("Z", "+00:00"))
+            if exp < datetime.now(timezone.utc):
+                return None
+        return promo
+    except Exception:
+        return None
+
+
+async def redeem_promo_code(user_uuid: str, code_raw: str) -> dict[str, Any]:
+    code = (code_raw or "").strip().upper()
+    if not code:
+        raise ValueError("Введіть промокод.")
+
+    def _process():
+        rows = supabase.table("promo_codes").select("*").eq("code", code).limit(1).execute().data or []
+        if not rows:
+            raise ValueError("Промокод не знайдено.")
+        promo = rows[0]
+        if not promo.get("is_active"):
+            raise ValueError("Цей промокод деактивовано.")
+        if promo.get("expires_at"):
+            exp = datetime.fromisoformat(str(promo["expires_at"]).replace("Z", "+00:00"))
+            if exp < datetime.now(timezone.utc):
+                raise ValueError("Термін дії промокоду минув.")
+        if int(promo.get("used_count") or 0) >= int(promo.get("max_uses") or 0):
+            raise ValueError("Ліміт активацій цього промокоду вичерпано.")
+
+        existing = (
+            supabase.table("promo_redemptions")
+            .select("id")
+            .eq("promo_id", promo["id"])
+            .eq("user_id", user_uuid)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if existing:
+            raise ValueError("Ви вже активували цей промокод раніше.")
+
+        supabase.table("promo_redemptions").insert({"promo_id": promo["id"], "user_id": user_uuid}).execute()
+        supabase.table("promo_codes").update({"used_count": int(promo.get("used_count") or 0) + 1}).eq("id", promo["id"]).execute()
+        return promo
+
+    promo = await run_db(_process)
+    if promo["promo_type"] == "trial":
+        days = int(promo.get("duration_days") or 14)
+        plan = str(promo.get("plan") or "pro").lower()
+        exp_iso = await activate_subscription(user_uuid, plan=plan, custom_days=days)
+        return {
+            "status": "trial_activated",
+            "plan": plan,
+            "days": days,
+            "expires_at": exp_iso,
+            "message": f"🎉 Промокод активовано! Вам надано тариф {plan.upper()} на {days} дн.",
+        }
+    else:
+        pct = int(promo.get("discount_percent") or 0)
+        await run_db(lambda: supabase.table("users").update({"active_promo_code": code}).eq("id", user_uuid).execute())
+        return {
+            "status": "discount_activated",
+            "discount_percent": pct,
+            "plan": promo.get("plan"),
+            "code": code,
+            "message": f"🏷️ Промокод {code} активовано! Знижка -{pct}% застосована до оплати підписки.",
+        }

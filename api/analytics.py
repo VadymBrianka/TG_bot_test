@@ -5,6 +5,8 @@ from aiohttp import web
 from db import supabase, run_db, get_exchange_rates
 from services.subscriptions import require_plan
 from services.advisor_ai import generate_financial_advice
+from services.finance_chat_ai import answer_finance_question
+from services.analytics_events import track_event
 
 
 async def handle_analytics_and_forecast(request: web.Request):
@@ -203,3 +205,26 @@ async def handle_analytics_advice(request: web.Request):
     except Exception as e:
         logging.error(f"Advice error: {e}")
         return web.json_response({"error": str(e) or "Помилка ШІ-радника"}, status=502)
+
+
+async def handle_analytics_chat(request: web.Request):
+    denied = await require_plan(request, "pro")
+    if denied:
+        return denied
+
+    user_uuid: str = request["user_uuid"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    question = str(body.get("question") or "").strip()
+    try:
+        answer = await answer_finance_question(user_uuid, question)
+        await track_event(user_uuid, "ai_finance_chat")
+        return web.json_response({"answer": answer})
+    except ValueError as ve:
+        return web.json_response({"error": str(ve)}, status=400)
+    except Exception as e:
+        logging.error(f"Finance chat error: {e}")
+        return web.json_response({"error": str(e) or "Помилка ШІ-асистента"}, status=502)

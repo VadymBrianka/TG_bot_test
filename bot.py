@@ -32,9 +32,22 @@ from api.investments import (
     handle_delete_investment,
     handle_refresh_investment_prices,
 )
-from api.analytics import handle_analytics_and_forecast, handle_analytics_advice
+from api.analytics import handle_analytics_and_forecast, handle_analytics_advice, handle_analytics_chat
 from api.market import handle_market_search, handle_market_quote
-from api.categories import handle_get_categories, handle_create_category, handle_delete_category
+from api.categories import (
+    handle_get_categories,
+    handle_create_category,
+    handle_delete_category,
+    handle_list_category_rules,
+    handle_create_category_rule,
+    handle_delete_category_rule,
+)
+from api.services_tracker import (
+    handle_list_services,
+    handle_create_service,
+    handle_toggle_service,
+    handle_delete_service,
+)
 from api.features import (
     handle_list_budgets,
     handle_create_budget,
@@ -64,10 +77,18 @@ from api.admin import (
     handle_admin_save_wallets,
     handle_admin_create_giveaway,
     handle_admin_draw_giveaway,
+    handle_admin_create_promo,
+    handle_admin_toggle_promo,
+    handle_admin_save_prices,
 )
 from api.receipts import handle_parse_receipt
 from api.debts import handle_list_debts, handle_create_debt, handle_settle_debt, handle_delete_debt
-from api.subscriptions import handle_get_plans, handle_create_stars_invoice, handle_create_crypto_request
+from api.subscriptions import (
+    handle_get_plans,
+    handle_create_stars_invoice,
+    handle_create_crypto_request,
+    handle_redeem_promo,
+)
 from api.trading import (
     handle_trading_overview,
     handle_trading_save_bot,
@@ -118,10 +139,19 @@ def create_web_app() -> web.Application:
     app.router.add_put("/api/v1/transactions/{id}", handle_update_transaction)
     app.router.add_delete("/api/v1/transactions/{id}", handle_delete_transaction)
 
-    # Categories
+    # Categories & Auto-Rules
     app.router.add_get("/api/v1/categories", handle_get_categories)
     app.router.add_post("/api/v1/categories", handle_create_category)
     app.router.add_delete("/api/v1/categories/{id}", handle_delete_category)
+    app.router.add_get("/api/v1/categories/rules", handle_list_category_rules)
+    app.router.add_post("/api/v1/categories/rules", handle_create_category_rule)
+    app.router.add_delete("/api/v1/categories/rules/{id}", handle_delete_category_rule)
+
+    # Paid Services Tracker (Pro+)
+    app.router.add_get("/api/v1/services", handle_list_services)
+    app.router.add_post("/api/v1/services", handle_create_service)
+    app.router.add_put("/api/v1/services/{id}/toggle", handle_toggle_service)
+    app.router.add_delete("/api/v1/services/{id}", handle_delete_service)
 
     # Accounts
     app.router.add_post("/api/v1/accounts", handle_create_account)
@@ -144,6 +174,7 @@ def create_web_app() -> web.Application:
     # Analytics & Calendar
     app.router.add_get("/api/v1/analytics/forecast", handle_analytics_and_forecast)
     app.router.add_get("/api/v1/analytics/advice", handle_analytics_advice)
+    app.router.add_post("/api/v1/analytics/chat", handle_analytics_chat)
     app.router.add_get("/api/v1/calendar", handle_get_calendar)
 
     # Budgets, Recurring, Alerts, Settings, CSV
@@ -177,6 +208,7 @@ def create_web_app() -> web.Application:
     app.router.add_get("/api/v1/subscriptions/plans", handle_get_plans)
     app.router.add_post("/api/v1/subscriptions/stars-invoice", handle_create_stars_invoice)
     app.router.add_post("/api/v1/subscriptions/crypto-request", handle_create_crypto_request)
+    app.router.add_post("/api/v1/subscriptions/promo", handle_redeem_promo)
 
     # VIP Demo Trading Bot
     app.router.add_get("/api/v1/trading/overview", handle_trading_overview)
@@ -205,6 +237,9 @@ def create_web_app() -> web.Application:
     app.router.add_post("/api/v1/admin/broadcast", handle_admin_broadcast)
     app.router.add_post("/api/v1/admin/broadcast/generate", handle_admin_generate_broadcast)
     app.router.add_post("/api/v1/admin/refresh-rates", handle_admin_refresh_rates)
+    app.router.add_post("/api/v1/admin/promos", handle_admin_create_promo)
+    app.router.add_put("/api/v1/admin/promos/{id}/toggle", handle_admin_toggle_promo)
+    app.router.add_put("/api/v1/admin/prices", handle_admin_save_prices)
 
     return app
 

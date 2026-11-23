@@ -17,7 +17,8 @@ from config import MINIAPP_URL
 from db import supabase, run_db, get_user_uuid_by_tg_id, get_exchange_rates, is_admin
 from services.export_csv import build_transactions_csv
 from services.advisor_ai import generate_financial_advice
-from services.subscriptions import get_user_subscription, has_plan
+from services.finance_chat_ai import answer_finance_question
+from services.subscriptions import get_user_subscription, has_plan, redeem_promo_code
 
 router = Router()
 
@@ -28,6 +29,8 @@ USER_COMMANDS = [
     BotCommand(command="month", description="Фінансовий звіт за місяць"),
     BotCommand(command="stats", description="Топ-5 категорій витрат за місяць"),
     BotCommand(command="advice", description="🧠 ШІ Фінансовий радник (Pro+)"),
+    BotCommand(command="ask", description="🤖 Запитати ШІ про свої фінанси (Pro+)"),
+    BotCommand(command="promo", description="🏷️ Активувати промокод"),
     BotCommand(command="debts", description="Борги та позики"),
     BotCommand(command="debt", description="Додати борг: /debt мені Олег 500 UAH"),
     BotCommand(command="goals", description="Мої цілі накопичення"),
@@ -636,3 +639,52 @@ async def cmd_advice(message: Message):
         await wait_msg.edit_text(f"🧠 <b>Персональна порада FinTrack AI:</b>\n\n{advice}")
     except Exception as e:
         await wait_msg.edit_text(f"❌ Не вдалося сформувати пораду: {e}")
+
+
+@router.message(Command("ask"))
+async def cmd_ask(message: Message):
+    if not message.from_user or not message.text:
+        return
+    sub = await get_user_subscription(message.from_user.id)
+    if not has_plan(sub["plan"], "pro"):
+        await message.reply("🔒 <b>ШІ-чат із фінансами доступний на тарифі Pro або VIP.</b>\nОформити: /subscribe", parse_mode="HTML")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply("Вкажіть питання, наприклад:\n<code>/ask Скільки я витратив на каву за осінь?</code>", parse_mode="HTML")
+        return
+
+    user_uuid = await get_user_uuid_by_tg_id(message.from_user.id)
+    if not user_uuid:
+        return
+
+    wait_msg = await message.reply("🤖 Аналізую ваші дані...")
+    try:
+        ans = await answer_finance_question(user_uuid, parts[1].strip())
+        await wait_msg.edit_text(f"🤖 <b>FinTrack AI:</b>\n\n{ans}", parse_mode="HTML")
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ Помилка ШІ-асистента: {e}")
+
+
+@router.message(Command("promo"))
+async def cmd_promo(message: Message):
+    if not message.from_user or not message.text:
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply("Вкажіть промокод, наприклад:\n<code>/promo START50</code>", parse_mode="HTML")
+        return
+
+    user_uuid = await get_user_uuid_by_tg_id(message.from_user.id)
+    if not user_uuid:
+        await message.answer("Спочатку натисніть /start")
+        return
+
+    try:
+        res = await redeem_promo_code(user_uuid, parts[1].strip())
+        await message.reply(res["message"], parse_mode="HTML")
+    except ValueError as ve:
+        await message.reply(f"❌ {ve}")
+    except Exception as e:
+        await message.reply(f"❌ Помилка активації: {e}")

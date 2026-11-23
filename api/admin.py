@@ -10,7 +10,13 @@ from config import MINIAPP_URL, GEMINI_API_KEY
 from db import supabase, run_db, is_admin
 from services.nbu import update_rates_from_nbu
 from services.broadcast_ai import generate_broadcast_draft
-from services.subscriptions import activate_subscription, get_crypto_wallets, save_crypto_wallets
+from services.subscriptions import (
+    activate_subscription,
+    get_crypto_wallets,
+    save_crypto_wallets,
+    get_effective_plans,
+    save_subscription_prices,
+)
 
 
 async def _require_admin(request: web.Request) -> web.Response | None:
@@ -89,9 +95,52 @@ async def handle_admin_overview(request: web.Request):
         except Exception:
             giveaways = []
 
+        try:
+            promo_codes = (
+                supabase.table("promo_codes")
+                .select("*")
+                .order("created_at", desc=True)
+                .limit(30)
+                .execute()
+                .data
+                or []
+            )
+        except Exception:
+            promo_codes = []
+
+        # Funnel & top features
+        all_users_list = users.data or []
+        total_u = max(len(all_users_list), 1)
+        free_cnt = sum(1 for u in all_users_list if (u.get("subscription_plan") or "free") == "free")
+        pro_cnt = sum(1 for u in all_users_list if u.get("subscription_plan") == "pro")
+        vip_cnt = sum(1 for u in all_users_list if u.get("subscription_plan") == "vip")
+        paid_cnt = pro_cnt + vip_cnt
+
+        top_features: list[dict] = []
+        try:
+            ev_rows = (
+                supabase.table("analytics_events")
+                .select("event_name")
+                .gte("created_at", d30)
+                .limit(1000)
+                .execute()
+                .data
+                or []
+            )
+            counts: dict[str, int] = {}
+            for er in ev_rows:
+                en = er.get("event_name") or "unknown"
+                counts[en] = counts.get(en, 0) + 1
+            top_features = [
+                {"name": k, "count": v}
+                for k, v in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:8]
+            ]
+        except Exception:
+            pass
+
         return {
             "stats": {
-                "users_count": users.count if users.count is not None else len(users.data or []),
+                "users_count": users.count if users.count is not None else len(all_users_list),
                 "transactions_count": tx_cnt,
                 "accounts_count": acc_cnt,
                 "goals_count": goal_cnt,
@@ -102,6 +151,14 @@ async def handle_admin_overview(request: web.Request):
                 "mau": mau,
                 "tx_7d": tx_7d,
                 "gemini_configured": bool(GEMINI_API_KEY),
+            },
+            "funnel": {
+                "free_count": free_cnt,
+                "pro_count": pro_cnt,
+                "vip_count": vip_cnt,
+                "paid_conversion_pct": round(paid_cnt / total_u * 100, 1),
+                "vip_share_pct": round(vip_cnt / total_u * 100, 1),
+                "top_features": top_features,
             },
             "users": [
                 {
@@ -115,14 +172,18 @@ async def handle_admin_overview(request: web.Request):
                     "subscription_plan": u.get("subscription_plan", "free"),
                     "subscription_expires_at": u.get("subscription_expires_at"),
                 }
-                for u in (users.data or [])
+                for u in all_users_list
             ],
             "broadcast_logs": b_logs,
             "pending_payments": pending_payments,
             "giveaways": giveaways,
+            "promo_codes": promo_codes,
         }
 
     data = await run_db(_load)
+    data["wallets"] = await get_crypto_wallets()
+    data["subscription_prices"] = await get_effective_plans()
+    return web.json_response(data)
     data["wallets"] = await get_crypto_wallets()
     return web.json_response(data)
 
@@ -217,10 +278,62 @@ async def handle_admin_broadcast(request: web.Request):
         tg_ids = [int(x.strip()) for x in custom_ids_raw.split(",") if x.strip().isdigit()]
     else:
         def _load_users():
-            rows = supabase.table("users").select("telegram_id, role, is_banned").execute().data or []
-            if target == "admins":
-                return [u["telegram_id"] for u in rows if u.get("telegram_id") and u.get("role") == "admin"]
-            return [u["telegram_id"] for u in rows if u.get("telegram_id") and not u.get("is_banned")]
+            rows = (
+                supabase.table("users")
+                .select("id, telegram_id, role, is_banned, subscription_plan, subscription_expires_at, last_active_at")
+                .execute()
+                .data
+                or []
+            )
+            now_dt = datetime.now(timezone.utc)
+            cutoff_7d = (now_dt - timedelta(days=7)).isoformat()
+            active_7d_ids: set[str] = set()
+            if target == "inactive_7d":
+                try:
+                    txs_7d = (
+                        supabase.table("transactions")
+                        .select("user_id")
+                        .gte("transaction_date", cutoff_7d)
+                        .execute()
+                        .data
+                        or []
+                    )
+                    active_7d_ids = {t["user_id"] for t in txs_7d}
+                except Exception:
+                    pass
+
+            out = []
+            for u in rows:
+                tid = u.get("telegram_id")
+                if not tid:
+                    continue
+                if target == "admins":
+                    if u.get("role") == "admin":
+                        out.append(tid)
+                    continue
+                if u.get("is_banned"):
+                    continue
+                plan = str(u.get("subscription_plan") or "free").lower()
+                exp = u.get("subscription_expires_at")
+                if target == "free":
+                    if plan == "free":
+                        out.append(tid)
+                elif target == "pro":
+                    if plan == "pro":
+                        out.append(tid)
+                elif target == "vip":
+                    if plan == "vip":
+                        out.append(tid)
+                elif target == "expired":
+                    if exp and str(exp) < now_dt.isoformat():
+                        out.append(tid)
+                elif target == "inactive_7d":
+                    last_act = str(u.get("last_active_at") or "")
+                    if u.get("id") not in active_7d_ids and (not last_act or last_act < cutoff_7d):
+                        out.append(tid)
+                else:
+                    out.append(tid)
+            return out
         tg_ids = await run_db(_load_users)
 
     sent = 0
@@ -552,3 +665,80 @@ async def handle_admin_draw_giveaway(request: web.Request):
         .execute()
     )
     return web.json_response({"status": "finished", "winners": winners})
+
+
+async def handle_admin_create_promo(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    code = str(body.get("code") or "").strip().upper()
+    promo_type = str(body.get("promo_type") or "trial").lower()
+    plan = str(body.get("plan") or "pro").lower()
+    duration_days = max(1, min(365, int(body.get("duration_days") or 14)))
+    discount_percent = max(0, min(90, int(body.get("discount_percent") or 0)))
+    max_uses = max(1, int(body.get("max_uses") or 100))
+
+    if not code or len(code) < 3:
+        return web.json_response({"error": "Код має містити щонайменше 3 символи"}, status=400)
+    if promo_type not in ("trial", "discount") or plan not in ("pro", "vip"):
+        return web.json_response({"error": "Некоректний тип або тариф"}, status=400)
+    if promo_type == "discount" and discount_percent <= 0:
+        return web.json_response({"error": "Вкажіть відсоток знижки (1-90%)"}, status=400)
+
+    try:
+        res = await run_db(
+            lambda: supabase.table("promo_codes")
+            .insert(
+                {
+                    "code": code[:32],
+                    "promo_type": promo_type,
+                    "plan": plan,
+                    "duration_days": duration_days,
+                    "discount_percent": discount_percent,
+                    "max_uses": max_uses,
+                    "is_active": True,
+                }
+            )
+            .execute()
+        )
+        return web.json_response({"status": "created", "promo": res.data[0]})
+    except Exception as e:
+        return web.json_response({"error": f"Не вдалося створити промокод: {e}"}, status=400)
+
+
+async def handle_admin_toggle_promo(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+    promo_id = request.match_info.get("id")
+    try:
+        rows = await run_db(
+            lambda: supabase.table("promo_codes").select("is_active").eq("id", promo_id).limit(1).execute().data or []
+        )
+        if not rows:
+            return web.json_response({"error": "Промокод не знайдено"}, status=404)
+        new_val = not bool(rows[0].get("is_active", True))
+        await run_db(lambda: supabase.table("promo_codes").update({"is_active": new_val}).eq("id", promo_id).execute())
+        return web.json_response({"status": "updated", "is_active": new_val})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
+
+
+async def handle_admin_save_prices(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+    try:
+        updated = await save_subscription_prices(body.get("prices") or body)
+        return web.json_response({"status": "saved", "subscription_prices": updated})
+    except Exception as e:
+        return web.json_response({"error": f"Помилка збереження цін: {e}"}, status=400)
