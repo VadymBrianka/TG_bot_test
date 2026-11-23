@@ -1,9 +1,11 @@
 import asyncio
+import csv
+import io
 import logging
 import random
 from datetime import datetime, timedelta, timezone
 from aiohttp import web
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, BufferedInputFile
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 
 from config import MINIAPP_URL, GEMINI_API_KEY
@@ -138,6 +140,33 @@ async def handle_admin_overview(request: web.Request):
         except Exception:
             pass
 
+        revenue = {"stars_total": 0, "usd_total": 0.0, "payments_count": 0, "stars_30d": 0, "usd_30d": 0.0}
+        try:
+            paid_rows = (
+                supabase.table("subscription_payments")
+                .select("payment_method, amount, status, created_at")
+                .in_("status", ["approved", "paid"])
+                .execute()
+                .data
+                or []
+            )
+            revenue["payments_count"] = len(paid_rows)
+            for pr in paid_rows:
+                amt = float(pr.get("amount") or 0)
+                is_30d = str(pr.get("created_at") or "") >= d30
+                if pr.get("payment_method") == "stars":
+                    revenue["stars_total"] += int(amt)
+                    if is_30d:
+                        revenue["stars_30d"] += int(amt)
+                else:
+                    revenue["usd_total"] += amt
+                    if is_30d:
+                        revenue["usd_30d"] += amt
+            revenue["usd_total"] = round(revenue["usd_total"], 2)
+            revenue["usd_30d"] = round(revenue["usd_30d"], 2)
+        except Exception:
+            pass
+
         return {
             "stats": {
                 "users_count": users.count if users.count is not None else len(all_users_list),
@@ -152,6 +181,7 @@ async def handle_admin_overview(request: web.Request):
                 "tx_7d": tx_7d,
                 "gemini_configured": bool(GEMINI_API_KEY),
             },
+            "revenue": revenue,
             "funnel": {
                 "free_count": free_cnt,
                 "pro_count": pro_cnt,
@@ -171,6 +201,7 @@ async def handle_admin_overview(request: web.Request):
                     "base_currency": u.get("base_currency", "UAH"),
                     "subscription_plan": u.get("subscription_plan", "free"),
                     "subscription_expires_at": u.get("subscription_expires_at"),
+                    "last_active_at": u.get("last_active_at"),
                 }
                 for u in all_users_list
             ],
@@ -306,6 +337,9 @@ async def handle_admin_broadcast(request: web.Request):
             for u in rows:
                 tid = u.get("telegram_id")
                 if not tid:
+                    continue
+                if target == "everybody":
+                    out.append(tid)
                     continue
                 if target == "admins":
                     if u.get("role") == "admin":
@@ -742,3 +776,108 @@ async def handle_admin_save_prices(request: web.Request):
         return web.json_response({"status": "saved", "subscription_prices": updated})
     except Exception as e:
         return web.json_response({"error": f"Помилка збереження цін: {e}"}, status=400)
+
+
+async def handle_admin_gift_segment(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    segment = str(body.get("segment") or "free").lower()
+    plan = str(body.get("plan") or "pro").lower()
+    days = max(1, min(365, int(body.get("days") or 7)))
+    if plan not in ("pro", "vip"):
+        return web.json_response({"error": "Некоректний тариф"}, status=400)
+
+    users = await run_db(
+        lambda: supabase.table("users")
+        .select("id, telegram_id, is_banned, subscription_plan, subscription_expires_at")
+        .execute()
+        .data
+        or []
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    targets = []
+    for u in users:
+        if u.get("is_banned"):
+            continue
+        u_plan = str(u.get("subscription_plan") or "free").lower()
+        exp = u.get("subscription_expires_at")
+        if segment == "all":
+            targets.append(u)
+        elif segment == "free" and u_plan == "free":
+            targets.append(u)
+        elif segment == "pro" and u_plan == "pro":
+            targets.append(u)
+        elif segment == "vip" and u_plan == "vip":
+            targets.append(u)
+        elif segment == "expired" and exp and str(exp) < now_iso:
+            targets.append(u)
+
+    bot = request.app.get("bot")
+    gifted = 0
+    for u in targets:
+        try:
+            new_exp = await activate_subscription(u["id"], plan=plan, custom_days=days)
+            gifted += 1
+            if bot and u.get("telegram_id"):
+                try:
+                    await bot.send_message(
+                        u["telegram_id"],
+                        f"🎁 <b>Подарунок від FinTrack Hub!</b>\n\n"
+                        f"Вам нараховано тариф <b>{plan.upper()}</b> на <b>{days} дн.</b> (до {new_exp[:10]})! 🚀",
+                        parse_mode="HTML",
+                    )
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return web.json_response({"status": "gifted", "count": gifted, "plan": plan, "days": days})
+
+
+async def handle_admin_export_users(request: web.Request):
+    denied = await _require_admin(request)
+    if denied:
+        return denied
+    bot = request.app.get("bot")
+    if not bot:
+        return web.json_response({"error": "Bot unavailable"}, status=500)
+
+    rows = await run_db(
+        lambda: supabase.table("users")
+        .select("telegram_id, username, first_name, role, is_banned, base_currency, subscription_plan, subscription_expires_at, last_active_at")
+        .order("telegram_id")
+        .execute()
+        .data
+        or []
+    )
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["telegram_id", "username", "first_name", "role", "is_banned", "base_currency", "plan", "expires_at", "last_active_at"])
+    for r in rows:
+        writer.writerow([
+            r.get("telegram_id", ""),
+            r.get("username", ""),
+            r.get("first_name", ""),
+            r.get("role", "user"),
+            r.get("is_banned", False),
+            r.get("base_currency", "UAH"),
+            r.get("subscription_plan", "free"),
+            str(r.get("subscription_expires_at") or "")[:10],
+            str(r.get("last_active_at") or "")[:19],
+        ])
+
+    csv_bytes = buf.getvalue().encode("utf-8-sig")
+    doc = BufferedInputFile(csv_bytes, filename=f"fintrack_users_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv")
+    await bot.send_document(
+        chat_id=request["tg_id"],
+        document=doc,
+        caption=f"📊 Експорт користувачів FinTrack Hub ({len(rows)} записів)",
+    )
+    return web.json_response({"status": "sent", "count": len(rows)})

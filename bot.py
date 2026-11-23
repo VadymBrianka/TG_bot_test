@@ -80,6 +80,8 @@ from api.admin import (
     handle_admin_create_promo,
     handle_admin_toggle_promo,
     handle_admin_save_prices,
+    handle_admin_gift_segment,
+    handle_admin_export_users,
 )
 from api.receipts import handle_parse_receipt
 from api.debts import handle_list_debts, handle_create_debt, handle_settle_debt, handle_delete_debt
@@ -240,6 +242,8 @@ def create_web_app() -> web.Application:
     app.router.add_post("/api/v1/admin/promos", handle_admin_create_promo)
     app.router.add_put("/api/v1/admin/promos/{id}/toggle", handle_admin_toggle_promo)
     app.router.add_put("/api/v1/admin/prices", handle_admin_save_prices)
+    app.router.add_post("/api/v1/admin/gift-segment", handle_admin_gift_segment)
+    app.router.add_post("/api/v1/admin/users/export", handle_admin_export_users)
 
     return app
 
