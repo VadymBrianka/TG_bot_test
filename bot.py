@@ -32,7 +32,7 @@ from api.investments import (
     handle_delete_investment,
     handle_refresh_investment_prices,
 )
-from api.analytics import handle_analytics_and_forecast, handle_analytics_advice, handle_analytics_chat
+from api.analytics import handle_analytics_and_forecast, handle_analytics_advice, handle_analytics_chat, handle_analytics_voice_chat
 from api.market import handle_market_search, handle_market_quote
 from api.categories import (
     handle_get_categories,
@@ -177,6 +177,7 @@ def create_web_app() -> web.Application:
     app.router.add_get("/api/v1/analytics/forecast", handle_analytics_and_forecast)
     app.router.add_get("/api/v1/analytics/advice", handle_analytics_advice)
     app.router.add_post("/api/v1/analytics/chat", handle_analytics_chat)
+    app.router.add_post("/api/v1/analytics/voice-chat", handle_analytics_voice_chat)
     app.router.add_get("/api/v1/calendar", handle_get_calendar)
 
     # Budgets, Recurring, Alerts, Settings, CSV

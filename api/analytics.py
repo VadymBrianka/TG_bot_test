@@ -5,7 +5,7 @@ from aiohttp import web
 from db import supabase, run_db, get_exchange_rates
 from services.subscriptions import require_plan
 from services.advisor_ai import generate_financial_advice
-from services.finance_chat_ai import answer_finance_question
+from services.finance_chat_ai import answer_finance_question, answer_finance_voice_dialogue
 from services.analytics_events import track_event
 
 
@@ -228,3 +228,38 @@ async def handle_analytics_chat(request: web.Request):
     except Exception as e:
         logging.error(f"Finance chat error: {e}")
         return web.json_response({"error": str(e) or "Помилка ШІ-асистента"}, status=502)
+
+
+async def handle_analytics_voice_chat(request: web.Request):
+    denied = await require_plan(request, "pro")
+    if denied:
+        return denied
+
+    user_uuid: str = request["user_uuid"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Некоректний JSON"}, status=400)
+
+    audio_b64 = body.get("audio_base64")
+    mime_type = str(body.get("mime_type") or "audio/webm").strip()
+    text_q = body.get("text")
+    history = body.get("history") if isinstance(body.get("history"), list) else []
+    speak = bool(body.get("speak", True))
+
+    try:
+        result = await answer_finance_voice_dialogue(
+            user_uuid=user_uuid,
+            audio_b64=audio_b64,
+            mime_type=mime_type,
+            text_question=text_q,
+            history=history,
+            speak=speak,
+        )
+        await track_event(user_uuid, "ai_voice_advisor")
+        return web.json_response(result)
+    except ValueError as ve:
+        return web.json_response({"error": str(ve)}, status=400)
+    except Exception as e:
+        logging.error(f"Voice chat error: {e}")
+        return web.json_response({"error": str(e) or "Помилка голосового ШІ-радника"}, status=502)

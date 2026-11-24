@@ -14,6 +14,7 @@ _RATE_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
 _AI_PATHS = {
     "/api/v1/receipts/parse",
     "/api/v1/analytics/chat",
+    "/api/v1/analytics/voice-chat",
     "/api/v1/analytics/advice",
     "/api/v1/admin/broadcast/generate",
 }
