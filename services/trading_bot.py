@@ -44,13 +44,23 @@ async def get_or_create_bot_config(user_uuid: str) -> dict[str, Any]:
         res = supabase.table("trading_bots").select("*").eq("user_id", user_uuid).limit(1).execute().data
         if res:
             return res[0]
-        ins = (
-            supabase.table("trading_bots")
-            .insert({"user_id": user_uuid, "auto_select": True, "symbols": [], "risk_profile": "balanced", "leverage": 5, "is_active": False})
-            .execute()
-            .data
-        )
-        return ins[0]
+        base_payload = {
+            "user_id": user_uuid,
+            "auto_select": True,
+            "symbols": [],
+            "risk_profile": "balanced",
+            "leverage": 5,
+            "is_active": False,
+        }
+        try:
+            ins = supabase.table("trading_bots").insert(base_payload).execute().data
+            return ins[0]
+        except Exception as e:
+            if "order_usdt" in str(e):
+                legacy_payload = {**base_payload, "order_usdt": 100.0}
+                ins = supabase.table("trading_bots").insert(legacy_payload).execute().data
+                return ins[0]
+            raise
     return await run_db(_q)
 
 
