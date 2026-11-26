@@ -350,9 +350,17 @@ CREATE TABLE IF NOT EXISTS support_messages (
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   telegram_id BIGINT NOT NULL,
   sender_role TEXT NOT NULL CHECK (sender_role IN ('user', 'admin')),
-  message_text TEXT NOT NULL,
+  message_text TEXT NOT NULL DEFAULT '',
+  attachment_type TEXT DEFAULT NULL,
+  attachment_name TEXT DEFAULT NULL,
+  attachment_file_id TEXT DEFAULT NULL,
   is_read BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE support_messages
+  ADD COLUMN IF NOT EXISTS attachment_type TEXT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS attachment_name TEXT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS attachment_file_id TEXT DEFAULT NULL;
 
 

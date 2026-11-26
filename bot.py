@@ -109,6 +109,7 @@ from api.support import (
     handle_get_faq,
     handle_get_support_messages,
     handle_send_support_message,
+    handle_get_support_media,
     handle_admin_support_threads,
     handle_admin_support_reply,
 )
@@ -129,7 +130,7 @@ dp.include_router(quick_entry.router)
 
 
 def create_web_app() -> web.Application:
-    app = web.Application(middlewares=[cors_middleware, auth_middleware], client_max_size=12 * 1024 * 1024)
+    app = web.Application(middlewares=[cors_middleware, auth_middleware], client_max_size=25 * 1024 * 1024)
     app["bot"] = bot
 
     # Health & Public
@@ -257,6 +258,7 @@ def create_web_app() -> web.Application:
     app.router.add_get("/api/v1/faq", handle_get_faq)
     app.router.add_get("/api/v1/support/messages", handle_get_support_messages)
     app.router.add_post("/api/v1/support/messages", handle_send_support_message)
+    app.router.add_get("/api/v1/support/media/{msg_id}", handle_get_support_media)
     app.router.add_get("/api/v1/admin/support/threads", handle_admin_support_threads)
     app.router.add_post("/api/v1/admin/support/{user_id}/reply", handle_admin_support_reply)
 
