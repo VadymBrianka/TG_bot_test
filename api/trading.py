@@ -55,14 +55,20 @@ async def handle_trading_overview(request: web.Request):
                 t = str(p["symbol"]).replace("USDT", "")
                 cur_p = price_map.get(t) or float(p["entry_price"])
                 entry_p = float(p["entry_price"])
-                qty = float(p["quantity"])
                 invested = float(p["usdt_invested"])
-                cur_val = qty * cur_p
-                unr_pnl = round(cur_val - invested, 2)
-                unr_pct = round(((cur_p - entry_p) / entry_p) * 100.0, 2) if entry_p > 0 else 0.0
+                side = str(p.get("side") or "long").lower()
+                lev = max(1, int(p.get("leverage") or 1))
+                if entry_p > 0:
+                    chg_pct = ((entry_p - cur_p) / entry_p) * 100.0 if side == "short" else ((cur_p - entry_p) / entry_p) * 100.0
+                else:
+                    chg_pct = 0.0
+                roe_pct = round(chg_pct * lev, 2)
+                unr_pnl = round(invested * (roe_pct / 100.0), 2)
+                p["side"] = side
+                p["leverage"] = lev
                 p["current_price"] = round(cur_p, 4)
                 p["unrealized_pnl"] = unr_pnl
-                p["unrealized_pct"] = unr_pct
+                p["unrealized_pct"] = roe_pct
 
         total_realized = round(sum(float(c.get("pnl_usdt") or 0) for c in closed_rows), 2)
         wins = sum(1 for c in closed_rows if float(c.get("pnl_usdt") or 0) > 0)
@@ -111,6 +117,7 @@ async def handle_trading_save_bot(request: web.Request):
     risk_profile = str(body.get("risk_profile") or "balanced").lower()
     if risk_profile not in ("conservative", "balanced", "aggressive"):
         risk_profile = "balanced"
+    leverage = max(1, min(20, int(body.get("leverage") or 5)))
     is_active = bool(body.get("is_active", True))
 
     res = await run_db(
@@ -120,6 +127,7 @@ async def handle_trading_save_bot(request: web.Request):
                 "auto_select": auto_select,
                 "symbols": symbols,
                 "risk_profile": risk_profile,
+                "leverage": leverage,
                 "is_active": is_active,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }

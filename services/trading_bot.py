@@ -13,9 +13,9 @@ ALL_PAIRS = [
 ]
 
 RISK_PROFILES: dict[str, dict[str, Any]] = {
-    "conservative": {"alloc_pct": 0.08, "tp_pct": 1.4, "sl_pct": 0.9, "max_positions": 4, "max_per_tick": 2},
-    "balanced": {"alloc_pct": 0.14, "tp_pct": 2.0, "sl_pct": 1.3, "max_positions": 6, "max_per_tick": 3},
-    "aggressive": {"alloc_pct": 0.22, "tp_pct": 2.8, "sl_pct": 1.8, "max_positions": 10, "max_per_tick": 4},
+    "conservative": {"alloc_pct": 0.08, "tp_pct": 1.4, "sl_pct": 0.9, "max_positions": 4, "max_per_tick": 2, "leverage": 2},
+    "balanced": {"alloc_pct": 0.14, "tp_pct": 2.0, "sl_pct": 1.3, "max_positions": 6, "max_per_tick": 3, "leverage": 5},
+    "aggressive": {"alloc_pct": 0.22, "tp_pct": 2.8, "sl_pct": 1.8, "max_positions": 10, "max_per_tick": 4, "leverage": 10},
 }
 
 
@@ -46,7 +46,7 @@ async def get_or_create_bot_config(user_uuid: str) -> dict[str, Any]:
             return res[0]
         ins = (
             supabase.table("trading_bots")
-            .insert({"user_id": user_uuid, "auto_select": True, "symbols": [], "risk_profile": "balanced", "is_active": False})
+            .insert({"user_id": user_uuid, "auto_select": True, "symbols": [], "risk_profile": "balanced", "leverage": 5, "is_active": False})
             .execute()
             .data
         )
@@ -84,36 +84,58 @@ async def _analyze_pair_signal(session: aiohttp.ClientSession, symbol: str) -> d
         sma20 = sum(win20) / 20.0
         std20 = (sum((x - sma20) ** 2 for x in win20) / 20.0) ** 0.5
         lower_bb = sma20 - 1.8 * std20
+        upper_bb = sma20 + 1.8 * std20
 
         # Volume surge
         avg_vol = sum(volumes[-20:-1]) / max(len(volumes[-20:-1]), 1)
         vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1.0
 
-        score = 0.0
-        strategy_tag = "Scalp Momentum"
+        # Evaluate LONG score
+        long_score = 0.0
+        long_tag = "Long Scalp"
         if price <= lower_bb and rsi < 42:
-            score += 45.0 + (45.0 - rsi) * 1.5
-            strategy_tag = f"BB Bounce (RSI {rsi})"
+            long_score += 45.0 + (45.0 - rsi) * 1.5
+            long_tag = f"BB Bounce (RSI {rsi})"
         elif rsi < 38:
-            score += (46.0 - rsi) * 2.2
-            strategy_tag = f"Oversold Scalp (RSI {rsi})"
+            long_score += (46.0 - rsi) * 2.2
+            long_tag = f"Oversold Long (RSI {rsi})"
         elif ema9 > ema21 and rsi < 66:
-            score += 28.0 + (66.0 - rsi) * 0.6
-            strategy_tag = f"EMA9>21 Trend (RSI {rsi})"
+            long_score += 28.0 + (66.0 - rsi) * 0.6
+            long_tag = f"EMA9>21 Uptrend (RSI {rsi})"
         elif closes[-1] > closes[-2] and rsi <= 68:
-            score += 16.0
-            strategy_tag = f"Breakout Pulse (RSI {rsi})"
-        elif rsi <= 72:
-            score += 8.0
-            strategy_tag = f"Active Entry (RSI {rsi})"
+            long_score += 14.0
+            long_tag = f"Bull Pulse (RSI {rsi})"
+
+        # Evaluate SHORT score
+        short_score = 0.0
+        short_tag = "Short Scalp"
+        if price >= upper_bb and rsi > 58:
+            short_score += 45.0 + (rsi - 55.0) * 1.5
+            short_tag = f"BB Reject Short (RSI {rsi})"
+        elif rsi > 62:
+            short_score += (rsi - 54.0) * 2.2
+            short_tag = f"Overbought Short (RSI {rsi})"
+        elif ema9 < ema21 and rsi > 34:
+            short_score += 28.0 + (rsi - 34.0) * 0.6
+            short_tag = f"EMA9<21 Downtrend (RSI {rsi})"
+        elif closes[-1] < closes[-2] and rsi >= 32:
+            short_score += 14.0
+            short_tag = f"Bear Breakdown (RSI {rsi})"
+
+        if short_score > long_score:
+            side = "short"
+            score = short_score
+            strategy_tag = short_tag
         else:
-            score -= 15.0  # avoid extreme overbought
+            side = "long"
+            score = long_score
+            strategy_tag = long_tag
 
         if vol_ratio >= 1.35 and score > 0:
             score += min(15.0, (vol_ratio - 1.0) * 10.0)
             strategy_tag += f" • Vol x{vol_ratio:.1f}"
 
-        return {"symbol": symbol, "price": price, "rsi": rsi, "score": score, "strategy": strategy_tag}
+        return {"symbol": symbol, "side": side, "price": price, "rsi": rsi, "score": score, "strategy": strategy_tag}
     except Exception:
         return None
 
@@ -126,13 +148,24 @@ async def close_position_at_price(
     user_tg_id: int | None = None,
 ) -> dict[str, Any]:
     user_uuid = pos["user_id"]
-    qty = float(pos["quantity"])
     entry_price = float(pos["entry_price"])
     invested = float(pos["usdt_invested"])
+    side = str(pos.get("side") or "long").lower()
+    leverage = max(1, int(pos.get("leverage") or 1))
 
-    proceeds = round(qty * exit_price, 4)
+    if entry_price > 0:
+        if side == "short":
+            price_chg_pct = ((entry_price - exit_price) / entry_price) * 100.0
+        else:
+            price_chg_pct = ((exit_price - entry_price) / entry_price) * 100.0
+    else:
+        price_chg_pct = 0.0
+
+    roe_pct = round(price_chg_pct * leverage, 2)
+    pnl_usdt = round(invested * (roe_pct / 100.0), 4)
+    proceeds = max(0.0, round(invested + pnl_usdt, 4))
     pnl_usdt = round(proceeds - invested, 4)
-    pnl_pct = round(((exit_price - entry_price) / entry_price) * 100.0, 2) if entry_price > 0 else 0.0
+    pnl_pct = roe_pct
 
     wallet = await get_or_create_demo_wallet(user_uuid)
     new_bal = round(float(wallet.get("demo_usdt") or 0) + proceeds, 4)
@@ -191,12 +224,20 @@ async def step_autonomous_bot(user_uuid: str, tg_bot=None, user_tg_id: int | Non
         if not cur_price or cur_price <= 0:
             continue
         entry = float(pos["entry_price"])
-        tp = float(pos.get("tp_pct") or 2.8)
-        sl = float(pos.get("sl_pct") or 1.8)
-        chg_pct = ((cur_price - entry) / entry) * 100.0 if entry > 0 else 0.0
+        tp = float(pos.get("tp_pct") or 2.0)
+        sl = float(pos.get("sl_pct") or 1.3)
+        side = str(pos.get("side") or "long").lower()
+        lev = max(1, int(pos.get("leverage") or 1))
+        if entry > 0:
+            chg_pct = ((entry - cur_price) / entry) * 100.0 if side == "short" else ((cur_price - entry) / entry) * 100.0
+        else:
+            chg_pct = 0.0
+        roe_pct = chg_pct * lev
 
-        if chg_pct >= tp:
-            closed_now.append(await close_position_at_price(pos, cur_price, f"Take Profit (+{chg_pct:.2f}%)", tg_bot, user_tg_id))
+        if roe_pct <= -95.0:
+            closed_now.append(await close_position_at_price(pos, cur_price, f"Liquidation ({roe_pct:.1f}% ROE)", tg_bot, user_tg_id))
+        elif chg_pct >= tp:
+            closed_now.append(await close_position_at_price(pos, cur_price, f"Take Profit (+{roe_pct:.1f}% ROE)", tg_bot, user_tg_id))
         elif chg_pct >= tp * 0.65 and chg_pct >= 0.85:
             # Lock in partial/quick profit if position is already well in green (>65% of TP)
             try:
@@ -205,9 +246,9 @@ async def step_autonomous_bot(user_uuid: str, tg_bot=None, user_tg_id: int | Non
             except Exception:
                 age_min = 0.0
             if age_min >= 10:
-                closed_now.append(await close_position_at_price(pos, cur_price, f"Smart Profit Lock (+{chg_pct:.2f}%)", tg_bot, user_tg_id))
+                closed_now.append(await close_position_at_price(pos, cur_price, f"Smart Profit Lock (+{roe_pct:.1f}% ROE)", tg_bot, user_tg_id))
         elif chg_pct <= -sl:
-            closed_now.append(await close_position_at_price(pos, cur_price, f"Stop Loss ({chg_pct:.2f}%)", tg_bot, user_tg_id))
+            closed_now.append(await close_position_at_price(pos, cur_price, f"Stop Loss ({roe_pct:.1f}% ROE)", tg_bot, user_tg_id))
 
     # Refresh wallet & open positions count
     wallet = await get_or_create_demo_wallet(user_uuid)
@@ -254,16 +295,18 @@ async def step_autonomous_bot(user_uuid: str, tg_bot=None, user_tg_id: int | Non
                 alloc_pct = float(profile["alloc_pct"])
                 tp_val = float(profile["tp_pct"])
                 sl_val = float(profile["sl_pct"])
+                leverage_val = max(1, min(20, int(cfg.get("leverage") or profile.get("leverage", 5))))
 
                 for best in picks:
                     if demo_bal < 50.0:
                         break
                     invest_usdt = round(min(max(demo_bal * alloc_pct, 50.0), min(demo_bal, 3000.0)), 2)
                     entry_price = float(best["price"])
-                    qty = round(invest_usdt / entry_price, 8)
+                    side_val = str(best.get("side") or "long").lower()
+                    qty = round((invest_usdt * leverage_val) / entry_price, 8)
                     demo_bal = round(demo_bal - invest_usdt, 4)
 
-                    def _open(b=best, inv=invest_usdt, ep=entry_price, q=qty, nb=demo_bal):
+                    def _open(b=best, inv=invest_usdt, ep=entry_price, q=qty, nb=demo_bal, sd=side_val, lv=leverage_val):
                         supabase.table("trading_wallets").update(
                             {"demo_usdt": nb, "updated_at": datetime.now(timezone.utc).isoformat()}
                         ).eq("user_id", user_uuid).execute()
@@ -273,6 +316,8 @@ async def step_autonomous_bot(user_uuid: str, tg_bot=None, user_tg_id: int | Non
                                 {
                                     "user_id": user_uuid,
                                     "symbol": b["symbol"],
+                                    "side": sd,
+                                    "leverage": lv,
                                     "strategy": f"{b['strategy']} ({profile_key})",
                                     "usdt_invested": inv,
                                     "quantity": q,
@@ -289,13 +334,15 @@ async def step_autonomous_bot(user_uuid: str, tg_bot=None, user_tg_id: int | Non
                     pos_row = await run_db(_open)
                     opened_now.append(pos_row)
                     if tg_bot and user_tg_id:
+                        side_badge = "🟢 LONG" if side_val == "long" else "🔴 SHORT"
                         try:
                             await tg_bot.send_message(
                                 user_tg_id,
-                                f"🤖 <b>[DEMO] Відкрито позицію {best['symbol']}</b>\n"
-                                f"💵 Сума: <b>{invest_usdt:.2f} USDT</b> @ <b>${entry_price:,.4f}</b>\n"
+                                f"🤖 <b>[DEMO] {side_badge} {leverage_val}x • {best['symbol']}</b>\n"
+                                f"💵 Маржа: <b>{invest_usdt:.2f} USDT</b> (Обсяг: ${invest_usdt * leverage_val:,.0f})\n"
+                                f"📍 Вхід: <b>${entry_price:,.4f}</b>\n"
                                 f"📊 Сигнал: <i>{best['strategy']}</i>\n"
-                                f"🎯 TP: +{tp_val}% | 🛡 SL: -{sl_val}%",
+                                f"🎯 TP: +{tp_val * leverage_val:.1f}% ROE | 🛡 SL: -{sl_val * leverage_val:.1f}% ROE",
                                 parse_mode="HTML",
                             )
                         except Exception:
