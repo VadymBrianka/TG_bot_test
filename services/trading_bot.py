@@ -7,13 +7,26 @@ import aiohttp
 from db import supabase, run_db
 from services.market_quotes import get_realtime_price
 
-ALL_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "TONUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"]
+ALL_PAIRS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "TONUSDT", "BNBUSDT", "XRPUSDT",
+    "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "NEARUSDT", "SUIUSDT",
+]
 
 RISK_PROFILES: dict[str, dict[str, Any]] = {
-    "conservative": {"alloc_pct": 0.05, "tp_pct": 2.0, "sl_pct": 1.2, "max_positions": 3},
-    "balanced": {"alloc_pct": 0.10, "tp_pct": 2.8, "sl_pct": 1.8, "max_positions": 4},
-    "aggressive": {"alloc_pct": 0.18, "tp_pct": 4.5, "sl_pct": 2.8, "max_positions": 6},
+    "conservative": {"alloc_pct": 0.08, "tp_pct": 1.4, "sl_pct": 0.9, "max_positions": 4, "max_per_tick": 2},
+    "balanced": {"alloc_pct": 0.14, "tp_pct": 2.0, "sl_pct": 1.3, "max_positions": 6, "max_per_tick": 3},
+    "aggressive": {"alloc_pct": 0.22, "tp_pct": 2.8, "sl_pct": 1.8, "max_positions": 10, "max_per_tick": 4},
 }
+
+
+def _calc_ema(values: list[float], period: int) -> float:
+    if not values:
+        return 0.0
+    k = 2.0 / (period + 1)
+    ema = values[0]
+    for v in values[1:]:
+        ema = v * k + ema * (1.0 - k)
+    return ema
 
 
 async def get_or_create_demo_wallet(user_uuid: str) -> dict[str, Any]:
@@ -42,15 +55,16 @@ async def get_or_create_bot_config(user_uuid: str) -> dict[str, Any]:
 
 
 async def _analyze_pair_signal(session: aiohttp.ClientSession, symbol: str) -> dict[str, Any] | None:
-    """Analyze 15m Binance klines (RSI-14 + EMA7/EMA21) and score entry attractiveness."""
+    """Analyze 5m Binance klines (RSI-14 + true EMA9/EMA21 + Bollinger pullback + volume surge)."""
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=15m&limit=30"
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=35"
         async with session.get(url) as resp:
             if resp.status != 200:
                 return None
             klines = await resp.json()
         closes = [float(k[4]) for k in klines]
-        if len(closes) < 21:
+        volumes = [float(k[5]) for k in klines]
+        if len(closes) < 22:
             return None
 
         price = closes[-1]
@@ -62,23 +76,42 @@ async def _analyze_pair_signal(session: aiohttp.ClientSession, symbol: str) -> d
         avg_l = sum(losses) / 14.0
         rsi = 100.0 if avg_l == 0 else round(100.0 - (100.0 / (1.0 + avg_g / avg_l)), 2)
 
-        ema7 = sum(closes[-7:]) / 7.0
-        ema21 = sum(closes[-21:]) / 21.0
+        ema9 = _calc_ema(closes[-21:], 9)
+        ema21 = _calc_ema(closes[-25:], 21)
 
-        # Higher score = better bullish / pullback entry
+        # Bollinger Bands (20)
+        win20 = closes[-20:]
+        sma20 = sum(win20) / 20.0
+        std20 = (sum((x - sma20) ** 2 for x in win20) / 20.0) ** 0.5
+        lower_bb = sma20 - 1.8 * std20
+
+        # Volume surge
+        avg_vol = sum(volumes[-20:-1]) / max(len(volumes[-20:-1]), 1)
+        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1.0
+
         score = 0.0
-        strategy_tag = "Momentum"
-        if rsi < 38:
-            score += (45 - rsi) * 2.0
-            strategy_tag = f"Oversold RSI {rsi}"
-        elif ema7 > ema21 and rsi < 62:
-            score += 25.0 + (62 - rsi) * 0.5
-            strategy_tag = f"Uptrend EMA (RSI {rsi})"
-        elif rsi <= 65:
-            score += 10.0
-            strategy_tag = f"Balanced (RSI {rsi})"
+        strategy_tag = "Scalp Momentum"
+        if price <= lower_bb and rsi < 42:
+            score += 45.0 + (45.0 - rsi) * 1.5
+            strategy_tag = f"BB Bounce (RSI {rsi})"
+        elif rsi < 38:
+            score += (46.0 - rsi) * 2.2
+            strategy_tag = f"Oversold Scalp (RSI {rsi})"
+        elif ema9 > ema21 and rsi < 66:
+            score += 28.0 + (66.0 - rsi) * 0.6
+            strategy_tag = f"EMA9>21 Trend (RSI {rsi})"
+        elif closes[-1] > closes[-2] and rsi <= 68:
+            score += 16.0
+            strategy_tag = f"Breakout Pulse (RSI {rsi})"
+        elif rsi <= 72:
+            score += 8.0
+            strategy_tag = f"Active Entry (RSI {rsi})"
         else:
-            score -= 20.0  # overbought, avoid buying top
+            score -= 15.0  # avoid extreme overbought
+
+        if vol_ratio >= 1.35 and score > 0:
+            score += min(15.0, (vol_ratio - 1.0) * 10.0)
+            strategy_tag += f" • Vol x{vol_ratio:.1f}"
 
         return {"symbol": symbol, "price": price, "rsi": rsi, "score": score, "strategy": strategy_tag}
     except Exception:
@@ -164,6 +197,15 @@ async def step_autonomous_bot(user_uuid: str, tg_bot=None, user_tg_id: int | Non
 
         if chg_pct >= tp:
             closed_now.append(await close_position_at_price(pos, cur_price, f"Take Profit (+{chg_pct:.2f}%)", tg_bot, user_tg_id))
+        elif chg_pct >= tp * 0.65 and chg_pct >= 0.85:
+            # Lock in partial/quick profit if position is already well in green (>65% of TP)
+            try:
+                opened_dt = datetime.fromisoformat(str(pos.get("opened_at") or "").replace("Z", "+00:00"))
+                age_min = (datetime.now(timezone.utc) - opened_dt).total_seconds() / 60.0
+            except Exception:
+                age_min = 0.0
+            if age_min >= 10:
+                closed_now.append(await close_position_at_price(pos, cur_price, f"Smart Profit Lock (+{chg_pct:.2f}%)", tg_bot, user_tg_id))
         elif chg_pct <= -sl:
             closed_now.append(await close_position_at_price(pos, cur_price, f"Stop Loss ({chg_pct:.2f}%)", tg_bot, user_tg_id))
 
@@ -205,52 +247,59 @@ async def step_autonomous_bot(user_uuid: str, tg_bot=None, user_tg_id: int | Non
                         break
 
             if valid:
-                best = max(valid, key=lambda x: x["score"])
+                valid.sort(key=lambda x: x["score"], reverse=True)
+                slots_left = max_concurrent - len(open_positions)
+                per_tick = min(slots_left, int(profile.get("max_per_tick", 3)))
+                picks = valid[:per_tick]
                 alloc_pct = float(profile["alloc_pct"])
                 tp_val = float(profile["tp_pct"])
                 sl_val = float(profile["sl_pct"])
-                invest_usdt = round(min(max(demo_bal * alloc_pct, 50.0), min(demo_bal, 2500.0)), 2)
-                entry_price = float(best["price"])
-                qty = round(invest_usdt / entry_price, 8)
-                new_bal = round(demo_bal - invest_usdt, 4)
 
-                def _open():
-                    supabase.table("trading_wallets").update(
-                        {"demo_usdt": new_bal, "updated_at": datetime.now(timezone.utc).isoformat()}
-                    ).eq("user_id", user_uuid).execute()
-                    return (
-                        supabase.table("trading_positions")
-                        .insert(
-                            {
-                                "user_id": user_uuid,
-                                "symbol": best["symbol"],
-                                "strategy": f"{best['strategy']} ({profile_key})",
-                                "usdt_invested": invest_usdt,
-                                "quantity": qty,
-                                "entry_price": round(entry_price, 4),
-                                "tp_pct": tp_val,
-                                "sl_pct": sl_val,
-                                "status": "open",
-                            }
-                        )
-                        .execute()
-                        .data[0]
-                    )
+                for best in picks:
+                    if demo_bal < 50.0:
+                        break
+                    invest_usdt = round(min(max(demo_bal * alloc_pct, 50.0), min(demo_bal, 3000.0)), 2)
+                    entry_price = float(best["price"])
+                    qty = round(invest_usdt / entry_price, 8)
+                    demo_bal = round(demo_bal - invest_usdt, 4)
 
-                pos_row = await run_db(_open)
-                opened_now.append(pos_row)
-                if tg_bot and user_tg_id:
-                    try:
-                        await tg_bot.send_message(
-                            user_tg_id,
-                            f"🤖 <b>[DEMO] Відкрито позицію {best['symbol']}</b>\n"
-                            f"💵 Сума: <b>{invest_usdt:.2f} USDT</b> @ <b>${entry_price:,.4f}</b>\n"
-                            f"📊 Сигнал: <i>{best['strategy']}</i>\n"
-                            f"🎯 TP: +2.8% | 🛡 SL: -1.8%",
-                            parse_mode="HTML",
+                    def _open(b=best, inv=invest_usdt, ep=entry_price, q=qty, nb=demo_bal):
+                        supabase.table("trading_wallets").update(
+                            {"demo_usdt": nb, "updated_at": datetime.now(timezone.utc).isoformat()}
+                        ).eq("user_id", user_uuid).execute()
+                        return (
+                            supabase.table("trading_positions")
+                            .insert(
+                                {
+                                    "user_id": user_uuid,
+                                    "symbol": b["symbol"],
+                                    "strategy": f"{b['strategy']} ({profile_key})",
+                                    "usdt_invested": inv,
+                                    "quantity": q,
+                                    "entry_price": round(ep, 4),
+                                    "tp_pct": tp_val,
+                                    "sl_pct": sl_val,
+                                    "status": "open",
+                                }
+                            )
+                            .execute()
+                            .data[0]
                         )
-                    except Exception:
-                        pass
+
+                    pos_row = await run_db(_open)
+                    opened_now.append(pos_row)
+                    if tg_bot and user_tg_id:
+                        try:
+                            await tg_bot.send_message(
+                                user_tg_id,
+                                f"🤖 <b>[DEMO] Відкрито позицію {best['symbol']}</b>\n"
+                                f"💵 Сума: <b>{invest_usdt:.2f} USDT</b> @ <b>${entry_price:,.4f}</b>\n"
+                                f"📊 Сигнал: <i>{best['strategy']}</i>\n"
+                                f"🎯 TP: +{tp_val}% | 🛡 SL: -{sl_val}%",
+                                parse_mode="HTML",
+                            )
+                        except Exception:
+                            pass
 
     return {"opened": len(opened_now), "closed": len(closed_now), "demo_usdt": demo_bal}
 
@@ -266,7 +315,7 @@ async def run_trading_bots_loop(tg_bot) -> None:
                 if res and res[0].get("value"):
                     try:
                         prev = datetime.fromisoformat(str(res[0]["value"]).replace("Z", "+00:00"))
-                        if (now_dt - prev).total_seconds() < 45:
+                        if (now_dt - prev).total_seconds() < 25:
                             return False
                     except Exception:
                         pass
@@ -290,4 +339,4 @@ async def run_trading_bots_loop(tg_bot) -> None:
                         await step_autonomous_bot(uid, tg_bot=tg_bot, user_tg_id=uid_to_tg.get(uid))
         except Exception as e:
             logging.debug(f"Trading loop skipped: {e}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
