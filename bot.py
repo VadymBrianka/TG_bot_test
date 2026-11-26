@@ -105,6 +105,13 @@ from api.family import (
     handle_family_join,
     handle_family_leave,
 )
+from api.support import (
+    handle_get_faq,
+    handle_get_support_messages,
+    handle_send_support_message,
+    handle_admin_support_threads,
+    handle_admin_support_reply,
+)
 
 from bot_handlers import admin, commands, quick_entry, callbacks, subscriptions
 
@@ -245,6 +252,13 @@ def create_web_app() -> web.Application:
     app.router.add_put("/api/v1/admin/prices", handle_admin_save_prices)
     app.router.add_post("/api/v1/admin/gift-segment", handle_admin_gift_segment)
     app.router.add_post("/api/v1/admin/users/export", handle_admin_export_users)
+
+    # FAQ & User-Admin Support Chat
+    app.router.add_get("/api/v1/faq", handle_get_faq)
+    app.router.add_get("/api/v1/support/messages", handle_get_support_messages)
+    app.router.add_post("/api/v1/support/messages", handle_send_support_message)
+    app.router.add_get("/api/v1/admin/support/threads", handle_admin_support_threads)
+    app.router.add_post("/api/v1/admin/support/{user_id}/reply", handle_admin_support_reply)
 
     return app
 

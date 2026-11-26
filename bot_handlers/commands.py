@@ -1,9 +1,10 @@
 import logging
 from datetime import datetime, timezone
-from aiogram import Router
+from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
+    CallbackQuery,
     WebAppInfo,
     MenuButtonWebApp,
     BufferedInputFile,
@@ -13,12 +14,13 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from config import MINIAPP_URL
+from config import MINIAPP_URL, ADMIN_ID
 from db import supabase, run_db, get_user_uuid_by_tg_id, get_exchange_rates, is_admin
 from services.export_csv import build_transactions_csv
 from services.advisor_ai import generate_financial_advice
 from services.finance_chat_ai import answer_finance_question
 from services.subscriptions import get_user_subscription, has_plan, redeem_promo_code
+from services.faq_data import FAQ_ITEMS
 
 router = Router()
 
@@ -42,11 +44,14 @@ USER_COMMANDS = [
     BotCommand(command="recurring", description="Регулярні платежі"),
     BotCommand(command="export", description="Отримати CSV-виписку в чат"),
     BotCommand(command="subscribe", description="💎 Підписка Pro / VIP"),
+    BotCommand(command="faq", description="❓ Часті запитання (FAQ)"),
+    BotCommand(command="support", description="💬 Написати в підтримку"),
     BotCommand(command="help", description="Довідка по командах і швидкому запису"),
 ]
 
 ADMIN_EXTRA_COMMANDS = [
     BotCommand(command="admin", description="🛡️ Панель адміністратора"),
+    BotCommand(command="reply", description="💬 Відповісти користувачу: /reply ID текст"),
     BotCommand(command="broadcast", description="📢 Розсилка всім користувачам"),
     BotCommand(command="setrole", description="👤 Змінити роль користувача"),
     BotCommand(command="givesub", description="💎 Видати підписку: /givesub ID pro 30"),
@@ -688,3 +693,146 @@ async def cmd_promo(message: Message):
         await message.reply(f"❌ {ve}")
     except Exception as e:
         await message.reply(f"❌ Помилка активації: {e}")
+
+
+def _faq_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=item["title"], callback_data=f"faq:{idx}")]
+            for idx, item in enumerate(FAQ_ITEMS)
+        ]
+    )
+
+
+@router.message(Command("faq"))
+async def cmd_faq(message: Message):
+    await message.answer(
+        "❓ <b>Часті запитання (FAQ) FinTrack Hub</b>\n\nОберіть тему нижче, щоб отримати детальну відповідь:",
+        reply_markup=_faq_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("faq:"))
+async def cb_faq_item(callback: CallbackQuery):
+    try:
+        idx = int((callback.data or "").split(":", 1)[1])
+        item = FAQ_ITEMS[idx]
+    except Exception:
+        await callback.answer("Тему не знайдено", show_alert=True)
+        return
+
+    if callback.message:
+        await callback.message.edit_text(
+            f"<b>{item['title']}</b>\n\n{item['answer']}\n\n"
+            "💬 Не знайшли відповідь? Напишіть у підтримку: <code>/support Ваше питання</code>",
+            reply_markup=_faq_keyboard(),
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@router.message(Command("support"))
+async def cmd_support(message: Message):
+    if not message.from_user or not message.text:
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply(
+            "💬 <b>Служба підтримки FinTrack Hub</b>\n\n"
+            "Напишіть ваше питання після команди, наприклад:\n"
+            "<code>/support Не пройшла оплата підписки</code>\n\n"
+            "Або відкрийте чат підтримки в Mini App: <b>Ще → 💬 Підтримка / FAQ</b>.",
+            parse_mode="HTML",
+        )
+        return
+
+    text = parts[1].strip()[:2000]
+    user_uuid = await get_user_uuid_by_tg_id(message.from_user.id)
+    if not user_uuid:
+        await message.answer("Спочатку натисніть /start")
+        return
+
+    try:
+        await run_db(
+            lambda: supabase.table("support_messages")
+            .insert(
+                {
+                    "user_id": user_uuid,
+                    "telegram_id": message.from_user.id,
+                    "sender_role": "user",
+                    "message_text": text,
+                    "is_read": False,
+                }
+            )
+            .execute()
+        )
+    except Exception:
+        pass
+
+    try:
+        uname = f"@{message.from_user.username}" if message.from_user.username else "без username"
+        await message.bot.send_message(
+            ADMIN_ID,
+            f"📩 <b>Нове звернення в підтримку!</b>\n\n"
+            f"👤 {message.from_user.first_name} ({uname}) • ID: <code>{message.from_user.id}</code>\n"
+            f"💬 <i>{text}</i>\n\n"
+            f"Відповісти: <code>/reply {message.from_user.id} Ваша відповідь</code>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    await message.reply(
+        "✅ <b>Ваше звернення надіслано адміністратору!</b>\n"
+        "Відповідь прийде прямо сюди в чат та збережеться в Mini App.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("reply"))
+async def cmd_admin_reply(message: Message):
+    if not message.from_user or not await is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit() or not parts[2].strip():
+        await message.reply("Формат: <code>/reply TELEGRAM_ID Текст відповіді</code>", parse_mode="HTML")
+        return
+
+    target_tg_id = int(parts[1])
+    reply_text = parts[2].strip()[:2000]
+    u_uuid = await get_user_uuid_by_tg_id(target_tg_id)
+    if u_uuid:
+        try:
+            await run_db(
+                lambda: supabase.table("support_messages")
+                .insert(
+                    {
+                        "user_id": u_uuid,
+                        "telegram_id": target_tg_id,
+                        "sender_role": "admin",
+                        "message_text": reply_text,
+                        "is_read": True,
+                    }
+                )
+                .execute()
+            )
+            await run_db(
+                lambda: supabase.table("support_messages")
+                .update({"is_read": True})
+                .eq("user_id", u_uuid)
+                .eq("sender_role", "user")
+                .execute()
+            )
+        except Exception:
+            pass
+
+    try:
+        await message.bot.send_message(
+            target_tg_id,
+            f"💬 <b>Відповідь підтримки FinTrack Hub:</b>\n\n{reply_text}",
+            parse_mode="HTML",
+        )
+        await message.reply(f"✅ Відповідь надіслано користувачу <code>{target_tg_id}</code>.", parse_mode="HTML")
+    except Exception as e:
+        await message.reply(f"❌ Не вдалося надіслати: {e}")
