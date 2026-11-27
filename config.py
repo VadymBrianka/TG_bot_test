@@ -1,3 +1,4 @@
+import hashlib
 import os
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -35,3 +36,13 @@ def _build_allowed_origins() -> list[str]:
 
 ALLOWED_ORIGINS: list[str] = _build_allowed_origins()
 PRIMARY_ORIGIN: str = ALLOWED_ORIGINS[0] if ALLOWED_ORIGINS else MINIAPP_URL.rstrip("/")
+
+WEBHOOK_URL: str = (
+    os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
+    or os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+)
+WEBHOOK_PATH: str = "/webhook/telegram"
+WEBHOOK_SECRET: str = (
+    os.getenv("WEBHOOK_SECRET", "").strip()
+    or hashlib.sha256(f"{BOT_TOKEN}:fintrack_wh".encode("utf-8")).hexdigest()[:32]
+)

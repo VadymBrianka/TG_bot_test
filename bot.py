@@ -1,10 +1,11 @@
 import asyncio
+import hmac
 import logging
 from aiohttp import web
 from aiogram import Bot, Dispatcher
-from aiogram.types import BotCommandScopeChat
+from aiogram.types import BotCommandScopeChat, Update
 
-from config import BOT_TOKEN, SERVER_PORT, ADMIN_ID
+from config import BOT_TOKEN, SERVER_PORT, ADMIN_ID, WEBHOOK_URL, WEBHOOK_PATH, WEBHOOK_SECRET
 from middlewares.auth import cors_middleware, auth_middleware
 from middlewares.bot_ban import BanCheckMiddleware
 from services.scheduler import start_scheduler
@@ -262,7 +263,24 @@ def create_web_app() -> web.Application:
     app.router.add_get("/api/v1/admin/support/threads", handle_admin_support_threads)
     app.router.add_post("/api/v1/admin/support/{user_id}/reply", handle_admin_support_reply)
 
+    # Telegram Webhook
+    app.router.add_post(WEBHOOK_PATH, handle_telegram_webhook)
+
     return app
+
+
+async def handle_telegram_webhook(request: web.Request) -> web.Response:
+    secret_hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(secret_hdr, WEBHOOK_SECRET):
+        return web.json_response({"error": "Forbidden"}, status=403)
+    try:
+        data = await request.json()
+        update = Update.model_validate(data, context={"bot": bot})
+        await dp.feed_update(bot, update)
+        return web.Response(text="ok")
+    except Exception as e:
+        logging.error(f"Webhook update error: {e}")
+        return web.Response(text="ok")
 
 
 async def main():
@@ -276,7 +294,6 @@ async def main():
     await site.start()
     logging.info(f"API сервер запущено на порті {SERVER_PORT}...")
 
-    await bot.delete_webhook(drop_pending_updates=True)
     try:
         await bot.set_my_commands(USER_COMMANDS)
         await bot.set_my_commands(
@@ -285,7 +302,20 @@ async def main():
         )
     except Exception as e:
         logging.warning(f"Failed to set bot commands: {e}")
-    await dp.start_polling(bot)
+
+    if WEBHOOK_URL:
+        full_webhook = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
+        await bot.set_webhook(
+            url=full_webhook,
+            secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=True,
+        )
+        logging.info(f"Telegram Webhook активовано: {full_webhook}")
+        await asyncio.Event().wait()
+    else:
+        logging.info("WEBHOOK_URL не задано — запуск у локальному режимі polling.")
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
